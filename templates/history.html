@@ -1,0 +1,159 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>TasteMate — My History</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="/static/style.css" />
+  <style>
+    .history-card {
+      background: white;
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 1.25rem;
+      margin-bottom: 1rem;
+      cursor: pointer;
+      transition: box-shadow 0.2s;
+    }
+    .history-card:hover { box-shadow: var(--shadow); }
+    .history-ts { font-size: 0.8rem; color: var(--text-muted); }
+    .history-cuisine { font-weight: 700; font-size: 1.05rem; margin: 0.3rem 0; }
+    .history-favs { font-size: 0.85rem; color: var(--text-muted); }
+    .history-recs { margin-top: 0.5rem; }
+    .history-recs-cuisine { font-weight: 600; font-size: 0.9rem; margin-top: 0.4rem; }
+    .history-recs-list { font-size: 0.82rem; color: var(--text-muted); }
+    .history-prefs { display: flex; flex-wrap: wrap; gap: 0.3rem; margin-top: 0.3rem; }
+
+    .detail-expanded {
+      background: #f9fafb;
+      border-radius: 10px;
+      padding: 1rem;
+      margin-top: 0.75rem;
+      font-size: 0.82rem;
+    }
+    .detail-expanded h4 { font-size: 0.85rem; margin-bottom: 0.3rem; }
+    .detail-expanded pre {
+      background: #1a1a2e;
+      color: #e2e8f0;
+      padding: 0.75rem;
+      border-radius: 8px;
+      overflow-x: auto;
+      font-size: 0.75rem;
+      max-height: 300px;
+      overflow-y: auto;
+    }
+    .back-link {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.3rem;
+      color: var(--primary);
+      text-decoration: none;
+      font-weight: 600;
+      font-size: 0.95rem;
+      margin-bottom: 1rem;
+    }
+    .back-link:hover { text-decoration: underline; }
+  </style>
+</head>
+<body>
+  <div class="header">
+    <div class="header-inner">
+      <div>
+        <h1>Taste<span>Mate</span></h1>
+        <p>Your recommendation history & audit trail</p>
+      </div>
+      <div class="user-bar">
+        <span class="user-name">{{ user.username }}</span>
+        <a href="/" class="header-link">Back to App</a>
+      </div>
+    </div>
+  </div>
+
+  <div class="container">
+    <a href="/" class="back-link">&larr; Back to Recommendations</a>
+    <h2 class="step-title">My Recommendation History</h2>
+    <p class="step-subtitle">Every recommendation is logged with full scoring details. Click any entry to see the audit trail.</p>
+
+    <div id="history-list">
+      <div class="loading"><div class="spinner"></div><p>Loading history...</p></div>
+    </div>
+  </div>
+
+  <script>
+    async function loadHistory() {
+      const res = await fetch("/api/audit/my-history");
+      if (res.status === 401) return window.location.href = "/login";
+      const data = await res.json();
+
+      if (data.length === 0) {
+        document.getElementById("history-list").innerHTML =
+          '<p style="color:var(--text-muted);padding:2rem;text-align:center">No recommendations yet. Go make some!</p>';
+        return;
+      }
+
+      let html = "";
+      data.forEach((entry) => {
+        const ts = new Date(entry.timestamp).toLocaleString();
+        const favs = (entry.favorite_dishes || []).join(", ");
+        const prefs = entry.taste_preferences || {};
+        const targets = entry.target_cuisines || [];
+
+        html += `<div class="history-card" onclick="toggleDetail(this, '${entry.id}')">
+          <div class="history-ts">${ts}</div>
+          <div class="history-cuisine">Loved: ${entry.source_cuisine} cuisine</div>
+          <div class="history-favs">Favorites: ${favs}</div>
+          <div class="history-prefs">
+            ${prefs.dietary ? `<span class="pref-pill">Diet: ${prefs.dietary}</span>` : ""}
+            ${prefs.spice_level ? `<span class="pref-pill">Spice: ${prefs.spice_level}</span>` : ""}
+            ${prefs.likes_creamy ? '<span class="pref-pill">Loves Creamy</span>' : ""}
+            ${prefs.likes_aromatic ? '<span class="pref-pill">Loves Aromatic</span>' : ""}
+          </div>
+          <div class="history-recs">`;
+
+        const recs = entry.recommendations || {};
+        for (const [cuisine, dishes] of Object.entries(recs)) {
+          html += `<div class="history-recs-cuisine">${cuisine}:</div>
+            <div class="history-recs-list">${Array.isArray(dishes) ? dishes.join(" | ") : JSON.stringify(dishes)}</div>`;
+        }
+
+        html += `</div>
+          <div class="detail-section-expanded" style="display:none"></div>
+        </div>`;
+      });
+
+      document.getElementById("history-list").innerHTML = html;
+    }
+
+    async function toggleDetail(card, logId) {
+      const detailEl = card.querySelector(".detail-section-expanded");
+      if (detailEl.style.display === "block") {
+        detailEl.style.display = "none";
+        return;
+      }
+
+      detailEl.innerHTML = '<p style="color:var(--text-muted)">Loading scoring details...</p>';
+      detailEl.style.display = "block";
+
+      const res = await fetch(`/api/audit/detail/${logId}`);
+      const data = await res.json();
+
+      let html = '<div class="detail-expanded">';
+      html += '<h4>User Flavor Profile Vector</h4>';
+      html += `<pre>${JSON.stringify(data.user_profile_vector, null, 2)}</pre>`;
+
+      html += '<h4 style="margin-top:0.75rem">Taste Preferences Applied</h4>';
+      html += `<pre>${JSON.stringify(data.taste_preferences, null, 2)}</pre>`;
+
+      html += '<h4 style="margin-top:0.75rem">Full Scoring Details (top dishes per cuisine)</h4>';
+      html += `<pre>${JSON.stringify(data.scoring_details, null, 2)}</pre>`;
+
+      html += '</div>';
+      detailEl.innerHTML = html;
+    }
+
+    loadHistory();
+  </script>
+</body>
+</html>

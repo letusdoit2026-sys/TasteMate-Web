@@ -1,0 +1,158 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>TasteMate — Discover Foods You'll Love</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+
+  <!-- Header -->
+  <div class="header">
+    <div class="header-inner">
+      <div>
+        <h1>Taste<span>Mate</span></h1>
+        <p>Tell us what you love. We'll find your next favorite dish across the world.</p>
+      </div>
+      <div class="user-bar">
+        <span class="user-name">{{ user.username }}</span>
+        <a href="/history" class="header-link">My History</a>
+        <button class="btn-logout" onclick="doLogout()">Logout</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Progress Bar — now 5 steps -->
+  <div class="progress-bar">
+    <div class="progress-step active"><div class="dot">1</div><span>Cuisine</span></div>
+    <div class="progress-line"></div>
+    <div class="progress-step"><div class="dot">2</div><span>Favorites</span></div>
+    <div class="progress-line"></div>
+    <div class="progress-step"><div class="dot">3</div><span>Taste</span></div>
+    <div class="progress-line"></div>
+    <div class="progress-step"><div class="dot">4</div><span>Explore</span></div>
+    <div class="progress-line"></div>
+    <div class="progress-step"><div class="dot">5</div><span>Results</span></div>
+  </div>
+
+  <div class="container">
+
+    <!-- ═══ Step 1: Select Source Cuisine ═══ -->
+    <section id="step-1" class="step active">
+      <h2 class="step-title">Which cuisine do you love?</h2>
+      <p class="step-subtitle">Pick the cuisine you know best. We'll build your flavor profile from it.</p>
+      <div id="source-cuisine-grid" class="cuisine-grid"></div>
+      <div class="btn-row">
+        <button id="btn-step1-next" class="btn btn-primary" disabled onclick="nextStep1()">Next &rarr;</button>
+      </div>
+    </section>
+
+    <!-- ═══ Step 2: Pick Favorite Dishes ═══ -->
+    <section id="step-2" class="step">
+      <h2 class="step-title">Pick your favorites</h2>
+      <p class="step-subtitle">Select at least 3 dishes you absolutely love. The more you pick, the better.</p>
+      <input type="text" id="dish-search" class="search-box" placeholder="Search dishes..." oninput="filterDishes()" />
+      <div id="dish-selection-info" class="selection-info">Click on dishes you love (select at least 3)</div>
+      <div id="dish-grid" class="dish-grid"></div>
+      <div class="btn-row">
+        <button class="btn btn-secondary" onclick="goToStep(1)">&larr; Back</button>
+        <button id="btn-step2-next" class="btn btn-primary" disabled onclick="nextStep2()">Next &rarr;</button>
+      </div>
+    </section>
+
+    <!-- ═══ Step 3: Taste Preferences ═══ -->
+    <section id="step-3" class="step">
+      <h2 class="step-title">Tell us about your taste</h2>
+      <p class="step-subtitle">These preferences help us fine-tune your recommendations.</p>
+
+      <div class="prefs-grid">
+        <!-- Dietary -->
+        <div class="pref-card">
+          <h3>Diet Preference</h3>
+          <p class="pref-desc">What do you usually eat?</p>
+          <div class="pref-options" data-pref="dietary">
+            <button class="pref-btn selected" data-val="any" onclick="selectPref('dietary','any',this)">Any / No Preference</button>
+            <button class="pref-btn" data-val="non-veg" onclick="selectPref('dietary','non-veg',this)">Non-Veg (Chicken, Meat, Fish)</button>
+            <button class="pref-btn" data-val="veg" onclick="selectPref('dietary','veg',this)">Vegetarian</button>
+            <button class="pref-btn" data-val="vegan" onclick="selectPref('dietary','vegan',this)">Vegan</button>
+            <button class="pref-btn" data-val="pescatarian" onclick="selectPref('dietary','pescatarian',this)">Pescatarian (Fish OK)</button>
+          </div>
+        </div>
+
+        <!-- Spice Level -->
+        <div class="pref-card">
+          <h3>Spice Tolerance</h3>
+          <p class="pref-desc">How much heat can you handle?</p>
+          <div class="pref-options" data-pref="spice_level">
+            <button class="pref-btn" data-val="mild" onclick="selectPref('spice_level','mild',this)">Mild — Keep it gentle</button>
+            <button class="pref-btn selected" data-val="medium" onclick="selectPref('spice_level','medium',this)">Medium — Some kick</button>
+            <button class="pref-btn" data-val="hot" onclick="selectPref('spice_level','hot',this)">Hot — Bring the fire!</button>
+          </div>
+        </div>
+
+        <!-- Flavor boosts -->
+        <div class="pref-card">
+          <h3>I especially love...</h3>
+          <p class="pref-desc">Toggle any that apply (optional)</p>
+          <div class="pref-toggles">
+            <label class="toggle-label">
+              <input type="checkbox" id="pref-creamy" onchange="updateTogglePref()" /> Rich & Creamy dishes
+            </label>
+            <label class="toggle-label">
+              <input type="checkbox" id="pref-aromatic" onchange="updateTogglePref()" /> Aromatic & Fragrant
+            </label>
+            <label class="toggle-label">
+              <input type="checkbox" id="pref-sweet" onchange="updateTogglePref()" /> Sweet flavors
+            </label>
+            <label class="toggle-label">
+              <input type="checkbox" id="pref-sour" onchange="updateTogglePref()" /> Sour / Tangy
+            </label>
+          </div>
+        </div>
+      </div>
+
+      <div class="btn-row">
+        <button class="btn btn-secondary" onclick="goToStep(2)">&larr; Back</button>
+        <button class="btn btn-primary" onclick="nextStep3()">Next &rarr;</button>
+      </div>
+    </section>
+
+    <!-- ═══ Step 4: Select Target Cuisines ═══ -->
+    <section id="step-4" class="step">
+      <h2 class="step-title">Which cuisines to explore?</h2>
+      <p class="step-subtitle">Select up to 5 cuisines you'd like recommendations for.</p>
+      <div id="target-selection-info" class="selection-info">Select 1 to 5 cuisines to explore</div>
+      <div id="target-cuisine-grid" class="cuisine-grid"></div>
+      <div class="btn-row">
+        <button class="btn btn-secondary" onclick="goToStep(3)">&larr; Back</button>
+        <button id="btn-recommend" class="btn btn-primary" disabled onclick="getRecommendations()">Get Recommendations</button>
+      </div>
+    </section>
+
+    <!-- ═══ Step 5: Results ═══ -->
+    <section id="step-5" class="step">
+      <h2 class="step-title">Your Personalized Picks</h2>
+      <p class="step-subtitle">Top 15 dishes per cuisine, ranked by how well they match your flavor DNA. Click any dish for full scoring details.</p>
+      <div id="results-container"></div>
+      <div class="btn-row">
+        <button class="btn btn-secondary" onclick="goToStep(4)">&larr; Change Cuisines</button>
+        <button class="btn btn-primary" onclick="startOver()">Start Over</button>
+      </div>
+    </section>
+
+  </div>
+
+  <!-- Detail Modal -->
+  <div id="detail-modal" class="modal-overlay" style="display:none" onclick="closeModal(event)">
+    <div class="modal-content" onclick="event.stopPropagation()">
+      <button class="modal-close" onclick="closeModalForce()">&times;</button>
+      <div id="modal-body"></div>
+    </div>
+  </div>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>
