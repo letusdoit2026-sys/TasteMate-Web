@@ -87,6 +87,8 @@ def init_db():
             username TEXT UNIQUE NOT NULL,
             email TEXT UNIQUE NOT NULL,
             password_hash TEXT NOT NULL,
+            security_question TEXT,
+            security_answer_hash TEXT,
             created_at TEXT NOT NULL
         );
         CREATE TABLE IF NOT EXISTS audit_logs (
@@ -340,17 +342,75 @@ def register_page():
     return render_template("auth.html", mode="register")
 
 
+@app.route("/forgot-password")
+def forgot_password_page():
+    return render_template("auth.html", mode="forgot")
+
+
+@app.route("/api/auth/forgot-get-question", methods=["POST"])
+def api_forgot_get_question():
+    """Step 1: User provides email, we return their security question."""
+    data = request.json
+    email = data.get("email", "").strip().lower()
+    if not email:
+        return jsonify({"error": "Please enter your email"}), 400
+
+    db = get_db()
+    row = db.execute("SELECT security_question FROM users WHERE email = ?", (email,)).fetchone()
+    if not row:
+        return jsonify({"error": "No account found with that email"}), 404
+    if not row["security_question"]:
+        return jsonify({"error": "This account has no security question set. Please contact support."}), 400
+
+    return jsonify({"security_question": row["security_question"]})
+
+
+@app.route("/api/auth/forgot-reset", methods=["POST"])
+def api_forgot_reset():
+    """Step 2: User answers security question + sets new password."""
+    data = request.json
+    email = data.get("email", "").strip().lower()
+    answer = data.get("security_answer", "").strip().lower()
+    new_password = data.get("new_password", "")
+
+    if not email or not answer or not new_password:
+        return jsonify({"error": "All fields are required"}), 400
+    if len(new_password) < 6:
+        return jsonify({"error": "New password must be at least 6 characters"}), 400
+
+    db = get_db()
+    row = db.execute("SELECT * FROM users WHERE email = ?", (email,)).fetchone()
+    if not row:
+        return jsonify({"error": "No account found with that email"}), 404
+
+    # Verify security answer
+    if not row["security_answer_hash"] or not bcrypt.check_password_hash(row["security_answer_hash"], answer):
+        return jsonify({"error": "Incorrect security answer"}), 401
+
+    # Reset password
+    new_hash = bcrypt.generate_password_hash(new_password).decode("utf-8")
+    db.execute("UPDATE users SET password_hash = ? WHERE email = ?", (new_hash, email))
+    db.commit()
+
+    log_audit(row["id"], row["username"], "PASSWORD_RESET_VIA_SECURITY_QUESTION")
+    return jsonify({"success": True})
+
+
 @app.route("/api/auth/register", methods=["POST"])
 def api_register():
     data = request.json
     username = data.get("username", "").strip()
     email = data.get("email", "").strip().lower()
     password = data.get("password", "")
+    security_question = data.get("security_question", "").strip()
+    security_answer = data.get("security_answer", "").strip().lower()
 
     if not username or not email or not password:
         return jsonify({"error": "All fields are required"}), 400
     if len(password) < 6:
         return jsonify({"error": "Password must be at least 6 characters"}), 400
+    if not security_question or not security_answer:
+        return jsonify({"error": "Security question and answer are required for password recovery"}), 400
 
     db = get_db()
     existing = db.execute("SELECT id FROM users WHERE username = ? OR email = ?", (username, email)).fetchone()
@@ -359,9 +419,11 @@ def api_register():
 
     user_id = str(uuid.uuid4())
     pw_hash = bcrypt.generate_password_hash(password).decode("utf-8")
+    answer_hash = bcrypt.generate_password_hash(security_answer).decode("utf-8")
     db.execute(
-        "INSERT INTO users (id, username, email, password_hash, created_at) VALUES (?, ?, ?, ?, ?)",
-        (user_id, username, email, pw_hash, datetime.datetime.utcnow().isoformat()),
+        """INSERT INTO users (id, username, email, password_hash, security_question, security_answer_hash, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?)""",
+        (user_id, username, email, pw_hash, security_question, answer_hash, datetime.datetime.utcnow().isoformat()),
     )
     db.commit()
 
