@@ -20,6 +20,7 @@
       <div class="user-bar">
         <span class="user-name">{{ user.username }}</span>
         <a href="/history" class="header-link">My History</a>
+        <a href="#" class="header-link" onclick="showChangePassword(); return false;">Change Password</a>
         <button class="btn-logout" onclick="doLogout()">Logout</button>
       </div>
     </div>
@@ -150,6 +151,32 @@
     <div class="modal-content" onclick="event.stopPropagation()">
       <button class="modal-close" onclick="closeModalForce()">&times;</button>
       <div id="modal-body"></div>
+    </div>
+  </div>
+
+  <!-- Change Password Modal -->
+  <div id="pw-modal" class="modal-overlay" style="display:none" onclick="if(event.target===this)closePwModal()">
+    <div class="modal-content" style="max-width:420px" onclick="event.stopPropagation()">
+      <button class="modal-close" onclick="closePwModal()">&times;</button>
+      <h2 class="modal-title">Change Password</h2>
+      <p class="modal-subtitle">Enter your current password and choose a new one.</p>
+      <div id="pw-error" style="background:#fef2f2;color:#dc2626;padding:0.5rem 0.8rem;border-radius:8px;font-size:0.85rem;margin-bottom:0.75rem;display:none"></div>
+      <div id="pw-success" style="background:#f0fdf4;color:#16a34a;padding:0.5rem 0.8rem;border-radius:8px;font-size:0.85rem;margin-bottom:0.75rem;display:none"></div>
+      <form onsubmit="return handleChangePassword(event)">
+        <div style="margin-bottom:0.75rem">
+          <label style="display:block;font-weight:600;font-size:0.85rem;margin-bottom:0.3rem">Current Password</label>
+          <input type="password" id="pw-current" required style="width:100%;padding:0.6rem 0.8rem;border:2px solid var(--border);border-radius:8px;font-size:0.95rem;outline:none" />
+        </div>
+        <div style="margin-bottom:0.75rem">
+          <label style="display:block;font-weight:600;font-size:0.85rem;margin-bottom:0.3rem">New Password</label>
+          <input type="password" id="pw-new" required minlength="6" style="width:100%;padding:0.6rem 0.8rem;border:2px solid var(--border);border-radius:8px;font-size:0.95rem;outline:none" />
+        </div>
+        <div style="margin-bottom:0.75rem">
+          <label style="display:block;font-weight:600;font-size:0.85rem;margin-bottom:0.3rem">Confirm New Password</label>
+          <input type="password" id="pw-confirm" required minlength="6" style="width:100%;padding:0.6rem 0.8rem;border:2px solid var(--border);border-radius:8px;font-size:0.95rem;outline:none" />
+        </div>
+        <button type="submit" class="btn btn-primary" style="width:100%">Update Password</button>
+      </form>
     </div>
   </div>
 

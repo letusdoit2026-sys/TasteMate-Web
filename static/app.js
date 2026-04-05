@@ -472,6 +472,55 @@ async function doLogout() {
   window.location.href = "/login";
 }
 
+// ── Change Password ──
+function showChangePassword() {
+  $("#pw-current").value = "";
+  $("#pw-new").value = "";
+  $("#pw-confirm").value = "";
+  $("#pw-error").style.display = "none";
+  $("#pw-success").style.display = "none";
+  $("#pw-modal").style.display = "flex";
+  document.body.style.overflow = "hidden";
+}
+
+function closePwModal() {
+  $("#pw-modal").style.display = "none";
+  document.body.style.overflow = "";
+}
+
+async function handleChangePassword(e) {
+  e.preventDefault();
+  const current = $("#pw-current").value;
+  const newPw = $("#pw-new").value;
+  const confirm = $("#pw-confirm").value;
+
+  $("#pw-error").style.display = "none";
+  $("#pw-success").style.display = "none";
+
+  if (newPw !== confirm) {
+    $("#pw-error").textContent = "New passwords don't match";
+    $("#pw-error").style.display = "block";
+    return false;
+  }
+
+  const res = await fetch("/api/auth/change-password", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ current_password: current, new_password: newPw }),
+  });
+  const data = await res.json();
+
+  if (data.error) {
+    $("#pw-error").textContent = data.error;
+    $("#pw-error").style.display = "block";
+  } else {
+    $("#pw-success").textContent = "Password changed successfully!";
+    $("#pw-success").style.display = "block";
+    setTimeout(closePwModal, 1500);
+  }
+  return false;
+}
+
 function startOver() {
   state.sourceCuisine = null;
   state.favoriteDishes = [];
