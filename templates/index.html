@@ -56,7 +56,7 @@
       <h2 class="step-title">Pick your favorites</h2>
       <p class="step-subtitle">Select at least 3 dishes you absolutely love. The more you pick, the better.</p>
       <input type="text" id="dish-search" class="search-box" placeholder="Search dishes..." oninput="filterDishes()" />
-      <div id="dish-selection-info" class="selection-info">Click on dishes you love (select at least 3)</div>
+      <div id="dish-selection-info" class="selection-info">Click on dishes you love (select at least 1)</div>
       <div id="dish-grid" class="dish-grid"></div>
       <div class="btn-row">
         <button class="btn btn-secondary" onclick="goToStep(1)">&larr; Back</button>
@@ -94,6 +94,38 @@
           </div>
         </div>
 
+        <!-- Protein / Meat Preferences -->
+        <div class="pref-card">
+          <h3>Protein Preferences</h3>
+          <p class="pref-desc">Select the proteins you eat. Unselected proteins will be excluded from recommendations.</p>
+          <div class="pref-toggles protein-toggles">
+            <label class="toggle-label">
+              <input type="checkbox" id="pref-protein-any" onchange="toggleProteinAny()" checked /> <strong>Any / No Preference</strong>
+            </label>
+            <label class="toggle-label">
+              <input type="checkbox" class="protein-check" data-protein="chicken" onchange="updateProteinPref()" /> Chicken
+            </label>
+            <label class="toggle-label">
+              <input type="checkbox" class="protein-check" data-protein="fish" onchange="updateProteinPref()" /> Fish & Seafood
+            </label>
+            <label class="toggle-label">
+              <input type="checkbox" class="protein-check" data-protein="lamb" onchange="updateProteinPref()" /> Lamb / Goat
+            </label>
+            <label class="toggle-label">
+              <input type="checkbox" class="protein-check" data-protein="beef" onchange="updateProteinPref()" /> Beef / Veal
+            </label>
+            <label class="toggle-label">
+              <input type="checkbox" class="protein-check" data-protein="pork" onchange="updateProteinPref()" /> Pork
+            </label>
+            <label class="toggle-label">
+              <input type="checkbox" class="protein-check" data-protein="duck" onchange="updateProteinPref()" /> Duck / Quail / Rabbit
+            </label>
+            <label class="toggle-label">
+              <input type="checkbox" class="protein-check" data-protein="egg" onchange="updateProteinPref()" /> Egg
+            </label>
+          </div>
+        </div>
+
         <!-- Flavor boosts -->
         <div class="pref-card">
           <h3>I especially love...</h3>
@@ -127,6 +159,7 @@
       <p class="step-subtitle">Select up to 5 cuisines you'd like recommendations for.</p>
       <div id="target-selection-info" class="selection-info">Select 1 to 5 cuisines to explore</div>
       <div id="target-cuisine-grid" class="cuisine-grid"></div>
+
       <div class="btn-row">
         <button class="btn btn-secondary" onclick="goToStep(3)">&larr; Back</button>
         <button id="btn-recommend" class="btn btn-primary" disabled onclick="getRecommendations()">Get Recommendations</button>
@@ -136,7 +169,7 @@
     <!-- ═══ Step 5: Results ═══ -->
     <section id="step-5" class="step">
       <h2 class="step-title">Your Personalized Picks</h2>
-      <p class="step-subtitle">Top 15 dishes per cuisine, ranked by how well they match your flavor DNA. Click any dish for full scoring details.</p>
+      <p class="step-subtitle">Compare recommendations from all engines side by side.</p>
       <div id="results-container"></div>
       <div class="btn-row">
         <button class="btn btn-secondary" onclick="goToStep(4)">&larr; Change Cuisines</button>

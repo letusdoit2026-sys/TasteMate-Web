@@ -16,8 +16,10 @@ const state = {
     likes_aromatic: false,
     likes_sweet: false,
     likes_sour: false,
+    allowed_proteins: "any",  // "any" or array like ["chicken","fish"]
   },
   results: null,
+  engine: "algorithm",  // "algorithm" or "llm"
 };
 
 const FLAGS = {
@@ -29,12 +31,32 @@ const FLAGS = {
 };
 
 const COURSE_ICONS = {
+  "Appetizer": "🥗", "Soup": "🍲", "Salad": "🥬", "Main Course": "🍛",
+  "Dessert": "🍮", "Drink": "🥤",
+  // Legacy names (fallback)
   "Appetizers": "🥗", "Soups": "🍲", "Salads": "🥬", "Entrees": "🍛",
-  "Sides & Breads": "🍞", "Snacks & Street Food": "🥟", "Desserts": "🍮", "Drinks": "🥤",
+  "Sides & Breads": "🍞", "Snacks & Street Food": "🥟", "Breakfast": "🍳", "Desserts": "🍮", "Drinks": "🥤",
 };
 
 const $ = (sel) => document.querySelector(sel);
 const $$ = (sel) => document.querySelectorAll(sel);
+
+// ══════════════════════════════════════════════════════════════════════════════
+//  ENGINE TOGGLE
+// ══════════════════════════════════════════════════════════════════════════════
+function setEngine(engine) {
+  state.engine = engine;
+  document.querySelectorAll(".engine-btn").forEach((btn) => btn.classList.remove("active"));
+  if (engine === "llm") {
+    document.getElementById("engine-llm").classList.add("active");
+  } else if (engine === "gemini") {
+    document.getElementById("engine-gemini").classList.add("active");
+  } else if (engine === "hybrid") {
+    document.getElementById("engine-hybrid").classList.add("active");
+  } else {
+    document.getElementById("engine-algo").classList.add("active");
+  }
+}
 
 // ══════════════════════════════════════════════════════════════════════════════
 //  STEP NAVIGATION
@@ -135,8 +157,8 @@ function toggleDish(name) {
 function updateDishInfo() {
   const c = state.favoriteDishes.length;
   $("#dish-selection-info").textContent =
-    c === 0 ? "Click on dishes you love (select at least 3)" : `${c} dish${c > 1 ? "es" : ""} selected`;
-  $("#btn-step2-next").disabled = c < 3;
+    c === 0 ? "Click on dishes you love (select at least 1)" : `${c} dish${c > 1 ? "es" : ""} selected`;
+  $("#btn-step2-next").disabled = c < 1;
 }
 
 function filterDishes() {
@@ -156,7 +178,7 @@ function filterDishes() {
 }
 
 function nextStep2() {
-  if (state.favoriteDishes.length < 3) return;
+  if (state.favoriteDishes.length < 1) return;
   goToStep(3);
 }
 
@@ -175,6 +197,28 @@ function updateTogglePref() {
   state.tastePrefs.likes_aromatic = $("#pref-aromatic").checked;
   state.tastePrefs.likes_sweet = $("#pref-sweet").checked;
   state.tastePrefs.likes_sour = $("#pref-sour").checked;
+}
+
+function toggleProteinAny() {
+  const anyCheck = $("#pref-protein-any");
+  document.querySelectorAll(".protein-check").forEach(cb => {
+    cb.checked = false;
+    cb.disabled = anyCheck.checked;
+  });
+  state.tastePrefs.allowed_proteins = anyCheck.checked ? "any" : [];
+}
+
+function updateProteinPref() {
+  const anyCheck = $("#pref-protein-any");
+  const checked = Array.from(document.querySelectorAll(".protein-check:checked")).map(cb => cb.dataset.protein);
+  if (checked.length === 0) {
+    anyCheck.checked = true;
+    document.querySelectorAll(".protein-check").forEach(cb => cb.disabled = true);
+    state.tastePrefs.allowed_proteins = "any";
+  } else {
+    anyCheck.checked = false;
+    state.tastePrefs.allowed_proteins = checked;
+  }
 }
 
 function nextStep3() {
@@ -215,26 +259,44 @@ function updateTargetInfo() {
 // ══════════════════════════════════════════════════════════════════════════════
 async function getRecommendations() {
   goToStep(5);
-  $("#results-container").innerHTML = `<div class="loading"><div class="spinner"></div><p>Analyzing flavor profiles & ingredients across ${state.targetCuisines.length} cuisine(s)...</p></div>`;
 
-  const res = await fetch("/api/recommend", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      source_cuisine: state.sourceCuisine,
-      favorite_dishes: state.favoriteDishes,
-      target_cuisines: state.targetCuisines,
-      taste_preferences: state.tastePrefs,
-    }),
+  const payload = JSON.stringify({
+    source_cuisine: state.sourceCuisine,
+    favorite_dishes: state.favoriteDishes,
+    target_cuisines: state.targetCuisines,
+    taste_preferences: state.tastePrefs,
   });
+  const headers = { "Content-Type": "application/json" };
 
-  const data = await res.json();
-  if (data.error) {
-    $("#results-container").innerHTML = `<p style="color:red;padding:2rem">${data.error}</p>`;
-    return;
-  }
-  state.results = data;
-  renderResults(data);
+  const engines = [
+    { key: "hybrid", label: "🔬 Hybrid Engine", endpoint: "/api/recommend-hybrid" },
+    { key: "algorithm", label: "⚙️ Algorithm", endpoint: "/api/recommend" },
+    { key: "llm", label: "🤖 Llama 3.3 70B", endpoint: "/api/recommend-llm" },
+    { key: "gemini", label: "✨ Gemini 2.5 Flash", endpoint: "/api/recommend-gemini" },
+  ];
+
+  // Initialize results array and build initial UI with loading placeholders
+  const engineResults = engines.map(e => ({ ...e, data: null, error: null, loading: true }));
+  state.results = engineResults;
+  renderComparisonResults(engineResults);
+
+  // Fire all engines in parallel, render each as it arrives
+  engines.forEach((eng, i) => {
+    fetch(eng.endpoint, { method: "POST", headers, body: payload })
+      .then(r => r.json())
+      .then(d => {
+        if (d.error) {
+          engineResults[i] = { ...eng, data: null, error: String(d.error), loading: false };
+        } else {
+          engineResults[i] = { ...eng, data: d, error: null, loading: false };
+        }
+        renderComparisonResults(engineResults);
+      })
+      .catch(err => {
+        engineResults[i] = { ...eng, data: null, error: String(err), loading: false };
+        renderComparisonResults(engineResults);
+      });
+  });
 }
 
 function renderResults(data) {
@@ -276,9 +338,28 @@ function renderResults(data) {
   }
   html += `</div></div>`;
 
+  // ── Engine badge ──
+  const engineLabel = data.engine === "hybrid" ? "🔬 Hybrid Engine" : data.engine === "gemini" ? "✨ Gemini 2.5 Flash" : data.engine === "llm" ? "🤖 Llama 3.3 70B via Groq" : "⚙️ Algorithm";
+  const engineClass = data.engine === "hybrid" ? "hybrid" : data.engine === "gemini" ? "gemini" : data.engine === "llm" ? "llm" : "algo";
+  html += `<div class="engine-badge-row">
+    <span class="engine-badge ${engineClass}">${engineLabel} recommendations</span>
+  </div>`;
+
   // ── Per-cuisine results, grouped by course ──
   for (const [cuisine, info] of Object.entries(data.recommendations)) {
-    const simPct = (info.cuisine_similarity * 100).toFixed(0);
+    // Handle API errors for this cuisine
+    if (info.error && (!info.courses || Object.keys(info.courses).length === 0)) {
+      html += `<div class="results-section">
+        <div class="cuisine-result-header">
+          <span style="font-size:1.6rem">${FLAGS[cuisine] || "🍽"}</span>
+          <h3>${cuisine}</h3>
+        </div>
+        <p style="color:#dc2626;padding:1rem;font-weight:500">⚠️ ${info.error}</p>
+      </div>`;
+      continue;
+    }
+
+    const simPct = info.cuisine_similarity != null ? (info.cuisine_similarity * 100).toFixed(0) : "?";
     const simColor = info.cuisine_similarity > 0.3 ? "var(--accent)" : info.cuisine_similarity > 0 ? "#b45309" : "#dc2626";
 
     html += `<div class="results-section">
@@ -286,9 +367,9 @@ function renderResults(data) {
         <span style="font-size:1.6rem">${FLAGS[cuisine] || "🍽"}</span>
         <h3>${cuisine}</h3>
         <span class="sim-badge" style="background:${simColor}15;color:${simColor}">
-          ${info.cuisine_similarity > 0 ? "+" : ""}${simPct}% similarity to ${data.source_cuisine}
+          ${simPct !== "?" ? ((info.cuisine_similarity > 0 ? "+" : "") + simPct + "% similarity to " + data.source_cuisine) : ""}
         </span>
-        <span class="eval-badge">${info.total_dishes_evaluated} dishes evaluated</span>
+        <span class="eval-badge">${info.total_dishes_evaluated || 0} dishes evaluated</span>
       </div>`;
 
     const courses = info.courses || {};
@@ -314,8 +395,190 @@ function renderResults(data) {
   $("#results-container").innerHTML = html;
 }
 
+// ══════════════════════════════════════════════════════════════════════════════
+//  SIDE-BY-SIDE COMPARISON VIEW
+// ══════════════════════════════════════════════════════════════════════════════
+function renderComparisonResults(engineResults) {
+  let html = "";
+
+  // Use the first successful result for profile/favorites display
+  const first = engineResults.find(e => e.data);
+  if (first && first.data.user_profile && Object.keys(first.data.user_profile).length) {
+    const d = first.data;
+    html += `<div class="profile-card">
+      <h3>Your Flavor DNA <span class="profile-sub">based on ${d.favorites_used.length} ${d.source_cuisine} dish${d.favorites_used.length > 1 ? "es" : ""}</span></h3>
+      <div class="prefs-summary">
+        <span class="pref-pill">Diet: ${d.taste_preferences.dietary || "Any"}</span>
+        <span class="pref-pill">Spice: ${d.taste_preferences.spice_level || "Medium"}</span>
+      </div>`;
+    if (d.favorites_with_courses) {
+      html += `<div class="fav-summary"><strong>Your favorites:</strong> `;
+      d.favorites_with_courses.forEach(f => {
+        html += `<span class="fav-course-group">${COURSE_ICONS[f.course] || ""} ${f.name}</span> `;
+      });
+      html += `</div>`;
+    }
+    html += `</div>`;
+  }
+
+  // Collect all cuisines — use target cuisines from state as baseline
+  const allCuisines = new Set(state.targetCuisines);
+  engineResults.forEach(e => {
+    if (e.data && e.data.recommendations) {
+      Object.keys(e.data.recommendations).forEach(c => allCuisines.add(c));
+    }
+  });
+
+  // For each target cuisine, show engines side by side
+  for (const cuisine of allCuisines) {
+    html += `<div class="comparison-cuisine-section">
+      <div class="cuisine-result-header">
+        <span style="font-size:1.6rem">${FLAGS[cuisine] || "🍽"}</span>
+        <h3>${cuisine}</h3>
+      </div>
+      <div class="comparison-grid">`;
+
+    for (const eng of engineResults) {
+      const engineClass = eng.key;
+      const badgeColors = {
+        algorithm: "background:#dbeafe;color:#1d4ed8",
+        llm: "background:#ede9fe;color:#6d28d9",
+        gemini: "background:#dbeafe;color:#1d4ed8",
+        hybrid: "background:#dcfce7;color:#15803d",
+      };
+
+      html += `<div class="comparison-column comparison-col-${engineClass}">
+        <div class="comparison-engine-header">
+          <span class="engine-badge" style="${badgeColors[engineClass] || ""}">${eng.label}</span>
+        </div>`;
+
+      if (eng.loading) {
+        html += `<div class="comparison-loading"><div class="spinner-sm"></div><span>Loading...</span></div>`;
+      } else if (!eng.data || eng.error) {
+        html += `<div class="comparison-error">⚠️ ${eng.error || "No results"}</div>`;
+      } else {
+        const info = eng.data.recommendations[cuisine];
+        if (!info) {
+          html += `<div class="comparison-error">No results for ${cuisine}</div>`;
+        } else {
+          const courses = info.courses || {};
+          if (Object.keys(courses).length === 0) {
+            html += `<div class="comparison-error">No matching dishes</div>`;
+          } else {
+            for (const [courseName, dishes] of Object.entries(courses)) {
+              const courseIcon = COURSE_ICONS[courseName] || "🍽";
+              html += `<div class="comparison-course">
+                <h5 class="comparison-course-title">${courseIcon} ${courseName}</h5>`;
+              dishes.forEach((dish, i) => {
+                html += renderCompactCard(dish, i, eng.key);
+              });
+              html += `</div>`;
+            }
+          }
+        }
+      }
+      html += `</div>`; // comparison-column
+    }
+
+    html += `</div></div>`; // comparison-grid, comparison-cuisine-section
+  }
+
+  $("#results-container").innerHTML = html;
+}
+
+function renderCompactCard(dish, i, engineKey) {
+  const borderColors = { algorithm: "#3b82f6", llm: "#8b5cf6", gemini: "#2563eb", hybrid: "#16a34a" };
+  const engineLabels = { algorithm: "Algorithm", llm: "Llama 3.3 70B", gemini: "Gemini 2.5 Flash", hybrid: "Hybrid Engine" };
+  const border = borderColors[engineKey] || "#ccc";
+  const dishData = JSON.stringify({...dish, _engine: engineKey, _engineLabel: engineLabels[engineKey] || engineKey}).replace(/'/g, "&#39;");
+  return `<div class="compact-card" style="border-left:3px solid ${border}" onclick='showCompactDetail(${dishData})'>
+    <div class="compact-card-top">
+      <span class="compact-rank">${i + 1}</span>
+      <div class="compact-info">
+        <strong>${dish.dish_name}</strong>
+        ${dish.matched_favorite ? `<div class="compact-match">Because you liked <em>${dish.matched_favorite}</em></div>` : ""}
+        <div class="compact-meta">
+          <span>${dish.category || ""}</span>
+          <span>${dish.dietary || ""}</span>
+          ${dish.protein ? `<span>${dish.protein}</span>` : ""}
+        </div>
+        <p class="compact-desc">${dish.description || ""}</p>
+      </div>
+      <div class="compact-score">
+        <span class="compact-score-pct">${dish.score}%</span>
+        <span class="compact-score-label">match</span>
+      </div>
+    </div>
+  </div>`;
+}
+
+function showCompactDetail(dish) {
+  const borderColors = { algorithm: "#3b82f6", llm: "#8b5cf6", gemini: "#2563eb", hybrid: "#16a34a" };
+  const border = borderColors[dish._engine] || "#ccc";
+  let html = `<div style="border-left:4px solid ${border};padding-left:1rem">`;
+  html += `<h2 style="margin:0 0 0.25rem">${dish.dish_name}</h2>`;
+  html += `<span class="engine-badge" style="font-size:0.7rem;padding:2px 8px;border-radius:8px;background:${border}15;color:${border}">${dish._engineLabel}</span>`;
+  html += `<p style="color:var(--text-muted);margin:0.5rem 0">${dish.category || ""} | ${dish.dietary || ""} ${dish.protein ? "| " + dish.protein : ""}</p>`;
+
+  if (dish.matched_favorite) {
+    html += `<div class="matched-fav-badge" style="margin:0.5rem 0">Because you liked <strong>${dish.matched_favorite}</strong> (${dish.matched_favorite_score || dish.score}% match)</div>`;
+  }
+
+  html += `<p style="font-size:0.85rem;margin:0.5rem 0">${dish.description || ""}</p>`;
+  if (dish.ingredients) {
+    html += `<p style="font-size:0.82rem"><strong>Ingredients:</strong> ${dish.ingredients}</p>`;
+  }
+  if (dish.why) {
+    html += `<div class="result-why" style="margin:0.5rem 0">${dish.why}</div>`;
+  }
+
+  // Score
+  html += `<div style="margin:0.75rem 0;padding:0.5rem;background:#f8fafc;border-radius:8px">
+    <strong style="font-size:1.1rem;color:${border}">${dish.score}% match</strong>`;
+  if (dish.flavor_distance != null) {
+    html += `<span style="margin-left:1rem;font-size:0.8rem;color:var(--text-muted)">Flavor distance: ${dish.flavor_distance}</span>`;
+  }
+  html += `</div>`;
+
+  // Flavor profile comparison (hybrid)
+  if (dish.flavor && dish.seed_flavor) {
+    html += `<div style="margin-top:0.75rem"><h4 style="margin-bottom:0.4rem">Flavor Comparison</h4>`;
+    html += `<div style="display:grid;grid-template-columns:80px 1fr 1fr;gap:2px;font-size:0.75rem">`;
+    html += `<div style="font-weight:600">Dimension</div><div style="font-weight:600">Your Favorite</div><div style="font-weight:600">This Dish</div>`;
+    for (const [dim, val] of Object.entries(dish.flavor)) {
+      const seedVal = dish.seed_flavor[dim] || 0;
+      html += `<div>${dim}</div><div>${seedVal}</div><div>${val}</div>`;
+    }
+    html += `</div></div>`;
+  }
+
+  // Scoring breakdown (algorithm)
+  if (dish.scoring && dish.scoring.cosine_sim) {
+    html += `<div style="margin-top:0.75rem"><h4 style="margin-bottom:0.4rem">Score Breakdown</h4>
+      <div style="font-size:0.8rem">
+        Flavor: ${dish.scoring.cosine_sim}% | Method: ${dish.scoring.cooking_method}% | Ingredients: ${dish.scoring.ingredient_match}% | Temp: ${dish.scoring.temperature_match}% | Diet: ${dish.scoring.dietary_compat}%
+      </div></div>`;
+  }
+
+  // Flavor bridge (LLM/Gemini)
+  if (dish.flavor_bridge) {
+    html += `<div class="flavor-bridge" style="margin-top:0.5rem">${dish.flavor_bridge}</div>`;
+  }
+
+  html += `</div>`;
+
+  $("#modal-body").innerHTML = html;
+  $("#detail-modal").style.display = "flex";
+  document.body.style.overflow = "hidden";
+}
+
 function renderDishCard(dish, i, userProfile) {
-  let html = `<div class="result-card" onclick='showDetail(${JSON.stringify(dish).replace(/'/g, "&#39;")}, ${JSON.stringify(userProfile).replace(/'/g, "&#39;")})'>
+  const isLLM = state.engine === "llm";
+  const isGemini = state.engine === "gemini";
+  const isHybrid = state.engine === "hybrid";
+  const isAI = isLLM || isGemini;
+  const cardClass = isHybrid ? ' hybrid-card' : isGemini ? ' gemini-card' : isLLM ? ' llm-card' : '';
+  let html = `<div class="result-card${cardClass}" onclick='showDetail(${JSON.stringify(dish).replace(/'/g, "&#39;")}, ${JSON.stringify(userProfile).replace(/'/g, "&#39;")})'>
     <div class="result-card-top">
       <div class="rank-badge rank-${i + 1}">${i + 1}</div>
       <div class="result-info">
@@ -323,25 +586,38 @@ function renderDishCard(dish, i, userProfile) {
 
   // "Because you liked X" badge
   if (dish.matched_favorite) {
-    html += `<div class="matched-fav-badge">Because you liked <strong>${dish.matched_favorite}</strong> (${dish.matched_favorite_score}% similar)</div>`;
+    html += `<div class="matched-fav-badge">Because you liked <strong>${dish.matched_favorite}</strong>${!isAI ? ` (${dish.matched_favorite_score}% similar)` : ''}</div>`;
   }
 
   html += `<div class="result-meta">
           <span class="result-tag">${dish.category}</span>
           <span class="result-tag">${dish.dietary}</span>
-          <span class="result-tag">${dish.protein}</span>
-          <span class="result-tag">Spice: ${dish.spice_level}</span>
+          ${dish.protein ? `<span class="result-tag">${dish.protein}</span>` : ''}
+          ${dish.spice_level ? `<span class="result-tag">Spice: ${dish.spice_level}</span>` : ''}
         </div>
         <p class="result-desc">${dish.description}</p>
-        <p class="result-ingredients"><strong>Ingredients:</strong> ${dish.ingredients}</p>
-        <div class="result-why">${dish.why}</div>
-        <div class="mini-scores">
-          <span class="mini-score"><span class="mini-dot cos"></span>Flavor: ${dish.scoring.cosine_sim}%</span>
-          <span class="mini-score"><span class="mini-dot ing"></span>Ingredients: ${dish.scoring.ingredient_match}%</span>
-          <span class="mini-score"><span class="mini-dot euc"></span>Distance: ${dish.scoring.euclidean_sim}%</span>
-          <span class="mini-score"><span class="mini-dot cui"></span>Cuisine: ${dish.scoring.cuisine_affinity}%</span>
-          <span class="mini-score"><span class="mini-dot imp"></span>Importance: ${dish.scoring.dish_importance}%</span>
+        ${dish.ingredients ? `<p class="result-ingredients"><strong>Ingredients:</strong> ${dish.ingredients}</p>` : ''}
+        <div class="result-why">${dish.why}</div>`;
+
+  if (isAI) {
+    // AI mode (Groq or Gemini): show match score + flavor bridge
+    const dotClass = isGemini ? 'gemini' : 'llm';
+    const aiLabel = isGemini ? 'Gemini Match' : 'AI Match';
+    html += `<div class="mini-scores llm-scores">
+          <span class="mini-score"><span class="mini-dot ${dotClass}"></span>${aiLabel}: ${dish.score}%</span>
+          ${dish.flavor_bridge ? `<span class="flavor-bridge">${dish.flavor_bridge}</span>` : ''}
         </div>`;
+  } else {
+    // Algorithm mode: show detailed scoring breakdown
+    html += `<div class="mini-scores">
+          <span class="mini-score"><span class="mini-dot cos"></span>Flavor: ${dish.scoring.cosine_sim}%</span>
+          <span class="mini-score"><span class="mini-dot cook"></span>Method: ${dish.scoring.cooking_method}%</span>
+          <span class="mini-score"><span class="mini-dot ing"></span>Ingredients: ${dish.scoring.ingredient_match}%</span>
+          <span class="mini-score"><span class="mini-dot temp"></span>Temp: ${dish.scoring.temperature_match}%</span>
+          <span class="mini-score"><span class="mini-dot ingcat"></span>IngType: ${dish.scoring.ingredient_category}%</span>
+          <span class="mini-score"><span class="mini-dot diet"></span>Diet: ${dish.scoring.dietary_compat}%</span>
+        </div>`;
+  }
 
   if (dish.similar_alternatives && dish.similar_alternatives.length > 0) {
     html += `<div class="alt-row">Similar: `;
@@ -386,28 +662,40 @@ function showDetail(dish, userProfile) {
         <div class="score-item-val" style="color:var(--primary)">${dish.score}%</div>
       </div>
       <div class="score-item">
-        <div class="score-item-label">Flavor Cosine (vector match)</div>
+        <div class="score-item-label">Flavor Match (weighted cosine)</div>
         <div class="score-item-val">${dish.scoring.cosine_sim}%</div>
       </div>
       <div class="score-item">
-        <div class="score-item-label">Ingredient Match (shared ingredients)</div>
-        <div class="score-item-val">${dish.scoring.ingredient_match}%</div>
+        <div class="score-item-label">Cooking Method Match</div>
+        <div class="score-item-val">${dish.scoring.cooking_method}%</div>
       </div>
       <div class="score-item">
-        <div class="score-item-label">Euclidean Similarity (distance)</div>
-        <div class="score-item-val">${dish.scoring.euclidean_sim}%</div>
+        <div class="score-item-label">Ingredient Match</div>
+        <div class="score-item-val">${dish.scoring.ingredient_match}%</div>
       </div>
       <div class="score-item">
         <div class="score-item-label">Cuisine Affinity (${state.sourceCuisine} link)</div>
         <div class="score-item-val">${dish.scoring.cuisine_affinity}%</div>
       </div>
       <div class="score-item">
+        <div class="score-item-label">Temperature Match</div>
+        <div class="score-item-val">${dish.scoring.temperature_match}%</div>
+      </div>
+      <div class="score-item">
+        <div class="score-item-label">Ingredient Type Match</div>
+        <div class="score-item-val">${dish.scoring.ingredient_category}%</div>
+      </div>
+      <div class="score-item">
+        <div class="score-item-label">Dietary Compatibility</div>
+        <div class="score-item-val">${dish.scoring.dietary_compat}%</div>
+      </div>
+      <div class="score-item">
         <div class="score-item-label">Dish Importance (popularity)</div>
         <div class="score-item-val">${dish.scoring.dish_importance}%</div>
       </div>
       <div class="score-item">
-        <div class="score-item-label">Spice Preference Bonus</div>
-        <div class="score-item-val">${dish.scoring.spice_bonus}%</div>
+        <div class="score-item-label">Flavor Deviation Penalty</div>
+        <div class="score-item-val" style="color:${dish.scoring.deviation_penalty > 0 ? '#ef4444' : 'inherit'}">-${dish.scoring.deviation_penalty}%</div>
       </div>
     </div>
   </div>`;

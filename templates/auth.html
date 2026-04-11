@@ -83,6 +83,16 @@
     .form-hint {
       font-size: 0.78rem; color: var(--text-muted); margin-top: 0.2rem;
     }
+    @media (max-width: 640px) {
+      .auth-wrapper { padding: 0.75rem; justify-content: flex-start; padding-top: 2rem; }
+      .auth-card { padding: 1.5rem 1.25rem; border-radius: 16px; }
+      .auth-logo h1 { font-size: 1.8rem; }
+      .auth-logo p { font-size: 0.85rem; }
+      .form-group input, .form-group select { font-size: 0.92rem; padding: 0.6rem 0.8rem; }
+      .form-group label { font-size: 0.82rem; }
+      .auth-btn { font-size: 0.92rem; padding: 0.7rem; }
+      .auth-switch { font-size: 0.82rem; }
+    }
   </style>
 </head>
 <body>
@@ -107,10 +117,7 @@
           <label>Email</label>
           <input type="email" id="reg-email" placeholder="your@email.com" required />
         </div>
-        <div class="form-group">
-          <label>Password</label>
-          <input type="password" id="reg-password" placeholder="At least 6 characters" required minlength="6" />
-        </div>
+        <p class="form-hint" style="margin-bottom:0.8rem;color:var(--primary);font-weight:500">Password is: <strong>tastemate</strong> (same for all users)</p>
         <div class="form-group">
           <label>Security Question</label>
           <select id="reg-security-question" required>
@@ -168,14 +175,7 @@
             <label id="forgot-question-label" style="font-size:1rem;color:var(--primary);font-weight:700">Loading question...</label>
             <input type="text" id="forgot-answer" placeholder="Your answer" required />
           </div>
-          <div class="form-group">
-            <label>New Password</label>
-            <input type="password" id="forgot-new-pw" placeholder="At least 6 characters" required minlength="6" />
-          </div>
-          <div class="form-group">
-            <label>Confirm New Password</label>
-            <input type="password" id="forgot-confirm-pw" placeholder="Repeat new password" required minlength="6" />
-          </div>
+          <p class="form-hint" style="margin-bottom:0.8rem;color:var(--primary);font-weight:500">Password will be reset to: <strong>tastemate</strong></p>
           <button type="submit" class="auth-btn">Reset Password</button>
         </form>
       </div>
@@ -206,10 +206,8 @@
         </div>
         <div class="form-group">
           <label>Password</label>
-          <input type="password" id="login-password" placeholder="Your password" required />
-        </div>
-        <div class="forgot-link">
-          <a href="/forgot-password">Forgot password?</a>
+          <input type="password" id="login-password" value="tastemate" required />
+          <p class="form-hint">Password is <strong>tastemate</strong> for all users</p>
         </div>
         <button type="submit" class="auth-btn">Log In</button>
       </form>
@@ -248,7 +246,6 @@
         body: JSON.stringify({
           username: document.getElementById("reg-username").value,
           email: document.getElementById("reg-email").value,
-          password: document.getElementById("reg-password").value,
           security_question: document.getElementById("reg-security-question").value,
           security_answer: document.getElementById("reg-security-answer").value,
         }),
@@ -302,12 +299,6 @@
     async function handleForgotStep2(e) {
       e.preventDefault();
       hideMessages();
-      const newPw = document.getElementById("forgot-new-pw").value;
-      const confirmPw = document.getElementById("forgot-confirm-pw").value;
-
-      if (newPw !== confirmPw) {
-        return showError("New passwords don't match");
-      }
 
       const res = await fetch("/api/auth/forgot-reset", {
         method: "POST",
@@ -315,7 +306,6 @@
         body: JSON.stringify({
           email: forgotEmail,
           security_answer: document.getElementById("forgot-answer").value,
-          new_password: newPw,
         }),
       });
       const data = await res.json();
