@@ -43,18 +43,24 @@ DISCOVERY_MAX_DIST = 0.5     # Step 5: only apply bonus if distance is already b
 RESULTS_COUNT = 3            # Final output size
 
 # Refinement 1: Warm Spice Cluster — keywords that indicate warm aromatic DNA
-WARM_SPICE_KEYWORDS = {"cinnamon", "clove", "allspice", "nutmeg", "cardamom", "star anise", "mace"}
+# Uses substring matching, so "cinnamon," or "cloves" will both match
+WARM_SPICE_KEYWORDS = [
+    "cinnamon", "clove", "allspice", "nutmeg", "cardamom",
+    "star anise", "mace", "whole spice", "warm spice",
+    "garam masala", "saffron", "bay leaf",
+]
 WARM_SPICE_DISTANCE_REDUCTION = 0.15   # 15% euclidean distance reduction
 
 # Refinement 2: Integrated Carbs — rice/pasta cooked INTO the dish
-INTEGRATED_CARB_KEYWORDS = {
+INTEGRATED_CARB_KEYWORDS = [
     "cooked with rice", "rice cooked", "baked with pasta", "pasta baked",
     "cooked in rice", "rice dish", "layered rice", "one-pot rice",
+    "layered basmati", "basmati rice",
     "pilaf", "biryani", "paella", "risotto", "pulao", "fried rice",
-    "youvetsi", "orzo baked", "rice casserole", "noodle soup",
-    "khao", "arroz",
-}
-INTEGRATED_CARB_BOOST = 0.15           # distance reduction for matching integrated-carb dishes
+    "youvetsi", "orzo", "rice casserole", "noodle soup",
+    "khao", "arroz", "turmeric rice",
+]
+INTEGRATED_CARB_BOOST = 0.25           # 25% distance reduction for matching integrated-carb dishes
 
 # Protein group mapping: UI selection → primary_protein values in CSV
 PROTEIN_GROUPS = {
@@ -243,7 +249,7 @@ class HybridEngine:
 
         # ── Step 3: Threshold Intersection (Mouthfeel Guard + Bonuses) ────
         seed_context = str(seed_row["context_string"]).lower()
-        seed_warm_spice = bool(WARM_SPICE_KEYWORDS & set(seed_context.split()))
+        seed_warm_spice = any(kw in seed_context for kw in WARM_SPICE_KEYWORDS)
         seed_integrated_carb = any(kw in seed_context for kw in INTEGRATED_CARB_KEYWORDS)
 
         guarded = []
@@ -252,58 +258,64 @@ class HybridEngine:
             cand_row = self.dishes.iloc[idx]
             cand_temp = str(cand_row["temp"]).strip().lower()
 
+            # ── Check warm spice & integrated carb FIRST (needed for guard exemptions) ──
+            cand_context = str(cand_row["context_string"]).lower()
+
+            # Refinement 1: Warm Spice Bonus
+            warm_spice_match = False
+            if seed_warm_spice:
+                if any(kw in cand_context for kw in WARM_SPICE_KEYWORDS):
+                    warm_spice_match = True
+
+            # Refinement 2: Integrated Carb Bonus
+            integrated_carb_match = False
+            if seed_integrated_carb:
+                if any(kw in cand_context for kw in INTEGRATED_CARB_KEYWORDS):
+                    integrated_carb_match = True
+
             # Crunch guard
             if seed_flavor[FLAVOR_DIMS.index("crunch")] > CRUNCH_THRESHOLD:
                 if cand_flavor[FLAVOR_DIMS.index("crunch")] < MOUTHFEEL_MIN:
                     continue
 
-            # Spicy guard
+            # Spicy guard — EXEMPT warm-spice matches (warm spice ≠ chili heat)
             if seed_flavor[FLAVOR_DIMS.index("spicy")] > SPICY_THRESHOLD:
                 if cand_flavor[FLAVOR_DIMS.index("spicy")] < MOUTHFEEL_MIN:
-                    continue
+                    if not warm_spice_match:
+                        continue  # only gate non-warm-spice dishes
 
             # Umami anchor: if seed is umami-heavy, candidate must also be
             if seed_flavor[FLAVOR_DIMS.index("umami")] > ANCHOR_THRESHOLD:
                 if cand_flavor[FLAVOR_DIMS.index("umami")] < ANCHOR_MIN:
                     continue
 
-            # Aromatic anchor: if seed is aromatic-heavy, candidate must also be
+            # Aromatic anchor (tightened): if seed aromatic > 0.8,
+            # hard-gate out candidates below 0.5, and penalize "low aroma" (< 0.6)
+            aromatic_penalty = False
             if seed_flavor[FLAVOR_DIMS.index("aromatic")] > ANCHOR_THRESHOLD:
-                if cand_flavor[FLAVOR_DIMS.index("aromatic")] < ANCHOR_MIN:
-                    continue
+                cand_aroma = cand_flavor[FLAVOR_DIMS.index("aromatic")]
+                if cand_aroma < 0.5:
+                    continue  # hard gate: below 0.5 = too bland, excluded
+                if cand_aroma < 0.6:
+                    aromatic_penalty = True  # soft penalty: 0.5-0.6 = penalized in Step 4
 
             # Temperature guard
             if seed_temp in ("cold", "hot"):
                 if cand_temp != seed_temp:
                     continue
 
-            # ── Refinement 1: Warm Spice Bonus ──
-            # If both seed and candidate share warm-spice DNA, flag for distance reduction
-            warm_spice_match = False
-            if seed_warm_spice:
-                cand_context = str(cand_row["context_string"]).lower()
-                if WARM_SPICE_KEYWORDS & set(cand_context.split()):
-                    warm_spice_match = True
-
-            # ── Refinement 2: Integrated Carb Bonus ──
-            # If seed is a "meat+carb integrated" dish, prefer candidates with same trait
-            integrated_carb_match = False
-            if seed_integrated_carb:
-                cand_context = str(cand_row["context_string"]).lower()
-                if any(kw in cand_context for kw in INTEGRATED_CARB_KEYWORDS):
-                    integrated_carb_match = True
-
-            guarded.append((idx, sem_score, warm_spice_match, integrated_carb_match))
+            guarded.append((idx, sem_score, warm_spice_match, integrated_carb_match, aromatic_penalty))
 
         if not guarded:
-            # Fallback: relax guards, keep semantic candidates (no bonuses)
-            guarded = [(idx, sem, False, False) for idx, sem in semantic_candidates]
+            # Fallback: relax guards, keep semantic candidates (no bonuses/penalties)
+            guarded = [(idx, sem, False, False, False) for idx, sem in semantic_candidates]
 
         # ── Step 4: Blended Re-Ranking (Flavor 2x + Semantic) ───────────
         candidate_indices = np.array([g[0] for g in guarded])
         sem_scores = np.array([g[1] for g in guarded])
         warm_spice_flags = [g[2] for g in guarded]
         integrated_carb_flags = [g[3] for g in guarded]
+        aromatic_penalty_flags = [g[4] for g in guarded]
         candidate_flavors = self.flavor_matrix[candidate_indices]
 
         # Euclidean flavor distance (weighted 2x)
@@ -318,6 +330,12 @@ class HybridEngine:
         for i, is_carb in enumerate(integrated_carb_flags):
             if is_carb:
                 flavor_distances[i] *= (1.0 - INTEGRATED_CARB_BOOST)
+
+        # ── Tightened Aromatic Anchor: penalize low-aroma candidates ──
+        # Inflate distance by 20% for "boring" dishes (aromatic 0.5-0.6 when seed > 0.8)
+        for i, has_penalty in enumerate(aromatic_penalty_flags):
+            if has_penalty:
+                flavor_distances[i] *= 1.20
 
         # Convert semantic similarity (0-1, higher=better) to a distance (lower=better)
         # sem_scores are cosine similarity from FAISS, range ~[0, 1]
