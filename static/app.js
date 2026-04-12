@@ -273,6 +273,7 @@ async function getRecommendations() {
     { key: "algorithm", label: "⚙️ Algorithm", endpoint: "/api/recommend" },
     { key: "llm", label: "🤖 Llama 3.3 70B", endpoint: "/api/recommend-llm" },
     { key: "gemini", label: "✨ Gemini 2.5 Flash", endpoint: "/api/recommend-gemini" },
+    { key: "xai", label: "🚀 Grok (x.AI)", endpoint: "/api/recommend-xai" },
   ];
 
   // Initialize results array and build initial UI with loading placeholders
@@ -487,8 +488,8 @@ function renderComparisonResults(engineResults) {
 }
 
 function renderCompactCard(dish, i, engineKey) {
-  const borderColors = { algorithm: "#3b82f6", llm: "#8b5cf6", gemini: "#2563eb", hybrid: "#16a34a" };
-  const engineLabels = { algorithm: "Algorithm", llm: "Llama 3.3 70B", gemini: "Gemini 2.5 Flash", hybrid: "Hybrid Engine" };
+  const borderColors = { algorithm: "#3b82f6", llm: "#8b5cf6", gemini: "#2563eb", hybrid: "#16a34a", xai: "#e11d48" };
+  const engineLabels = { algorithm: "Algorithm", llm: "Llama 3.3 70B", gemini: "Gemini 2.5 Flash", hybrid: "Hybrid Engine", xai: "Grok (x.AI)" };
   const border = borderColors[engineKey] || "#ccc";
   const dishData = JSON.stringify({...dish, _engine: engineKey, _engineLabel: engineLabels[engineKey] || engineKey}).replace(/'/g, "&#39;");
   return `<div class="compact-card" style="border-left:3px solid ${border}" onclick='showCompactDetail(${dishData})'>
@@ -502,7 +503,7 @@ function renderCompactCard(dish, i, engineKey) {
           <span>${dish.dietary || ""}</span>
           ${dish.protein ? `<span>${dish.protein}</span>` : ""}
         </div>
-        <p class="compact-desc">${dish.description || ""}</p>
+        ${dish.why && engineKey === "hybrid" ? `<p class="compact-why">${dish.why}</p>` : `<p class="compact-desc">${dish.description || ""}</p>`}
       </div>
       <div class="compact-score">
         <span class="compact-score-pct">${dish.score}%</span>
@@ -513,7 +514,7 @@ function renderCompactCard(dish, i, engineKey) {
 }
 
 function showCompactDetail(dish) {
-  const borderColors = { algorithm: "#3b82f6", llm: "#8b5cf6", gemini: "#2563eb", hybrid: "#16a34a" };
+  const borderColors = { algorithm: "#3b82f6", llm: "#8b5cf6", gemini: "#2563eb", hybrid: "#16a34a", xai: "#e11d48" };
   const border = borderColors[dish._engine] || "#ccc";
   let html = `<div style="border-left:4px solid ${border};padding-left:1rem">`;
   html += `<h2 style="margin:0 0 0.25rem">${dish.dish_name}</h2>`;

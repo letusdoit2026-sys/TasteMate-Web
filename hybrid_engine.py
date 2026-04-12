@@ -215,9 +215,11 @@ class HybridEngine:
                 self.dishes["category"].str.lower() == category_filter.lower()
             )
         else:
-            # Default: same category as seed (Appetizer→Appetizer, Main→Main)
+            # Default: same category as seed, but Appetizer↔Salad are interchangeable
+            SIBLING_CATEGORIES = {"appetizer": {"appetizer", "salad"}, "salad": {"appetizer", "salad"}}
+            allowed_cats = SIBLING_CATEGORIES.get(seed_category.lower(), {seed_category.lower()})
             mask = mask & (
-                self.dishes["category"].str.lower() == seed_category.lower()
+                self.dishes["category"].str.lower().isin(allowed_cats)
             )
 
         # Target cuisine constraint
@@ -370,6 +372,8 @@ class HybridEngine:
             idx = int(candidate_indices[pos])
             dist = float(distances[pos])
             row = self.dishes.iloc[idx]
+            is_warm = warm_spice_flags[pos]
+            is_carb = integrated_carb_flags[pos]
 
             # ── Refinement 3: Gaussian Kernel match score ──
             # e^(-(d²)/2) × 100  →  close matches score 80-90%+
@@ -382,6 +386,12 @@ class HybridEngine:
                     c_sim = float(self.sim_df.loc[seed_cuisine, str(row["cuisine"])])
                 except (KeyError, ValueError):
                     c_sim = 0.0
+
+            # Build rich match reason
+            match_reason = self._build_match_reason(
+                seed_flavor, self.flavor_matrix[idx],
+                seed_row, row, is_warm, is_carb, c_sim,
+            )
 
             results.append({
                 "rank": rank + 1,
@@ -396,6 +406,7 @@ class HybridEngine:
                 "flavor_distance": round(dist, 4),
                 "cuisine_similarity": round(c_sim, 2),
                 "context_string": str(row["context_string"]),
+                "match_reason": match_reason,
                 "flavor": {
                     dim: round(float(row[dim]), 2) for dim in FLAVOR_DIMS
                 },
@@ -429,6 +440,53 @@ class HybridEngine:
     # ──────────────────────────────────────────────────────────────────────
     #  HELPERS
     # ──────────────────────────────────────────────────────────────────────
+
+    def _build_match_reason(
+        self, seed_flavor, cand_flavor, seed_row, cand_row,
+        is_warm_spice: bool, is_integrated_carb: bool, cuisine_sim: float,
+    ) -> str:
+        """Build a rich, human-readable explanation of why this dish matched."""
+        parts = []
+
+        # 1. Shared flavor traits (dimensions where both are strong)
+        LABELS = {
+            "sweet": "sweet", "salt": "savory", "sour": "tangy/citrus-forward",
+            "bitter": "bitter", "umami": "umami-rich", "spicy": "spicy",
+            "fat": "rich/creamy", "aromatic": "aromatic", "crunch": "crunchy",
+            "chew": "chewy",
+        }
+        shared_strong = []
+        for i, dim in enumerate(FLAVOR_DIMS):
+            sv, cv = float(seed_flavor[i]), float(cand_flavor[i])
+            if sv >= 0.6 and cv >= 0.6:
+                shared_strong.append(LABELS.get(dim, dim))
+        if shared_strong:
+            parts.append("Both are " + ", ".join(shared_strong[:4]))
+
+        # 2. Temperature match
+        seed_temp = str(seed_row["temp"]).strip().lower()
+        cand_temp = str(cand_row["temp"]).strip().lower()
+        if seed_temp == cand_temp and seed_temp in ("hot", "cold"):
+            parts.append(f"served {seed_temp}")
+
+        # 3. Warm spice bonus
+        if is_warm_spice:
+            parts.append("share warm-spice DNA (cinnamon, clove, cardamom)")
+
+        # 4. Integrated carb bonus
+        if is_integrated_carb:
+            parts.append("both cook protein with the grain/starch (not on the side)")
+
+        # 5. Cuisine bridge
+        if cuisine_sim > 0.4:
+            parts.append(f"strong cuisine affinity ({cuisine_sim:.0%})")
+        elif cuisine_sim > 0.2:
+            parts.append(f"moderate cuisine affinity ({cuisine_sim:.0%})")
+
+        if not parts:
+            parts.append("similar overall flavor profile")
+
+        return " · ".join(parts)
 
     def _dietary_mask(self, dietary: str) -> np.ndarray:
         """Return boolean mask for dietary compatibility."""

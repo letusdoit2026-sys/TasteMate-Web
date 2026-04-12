@@ -614,7 +614,7 @@ body {
 }
 .comparison-grid {
   display: grid;
-  grid-template-columns: repeat(4, 1fr);
+  grid-template-columns: repeat(5, 1fr);
   gap: 0.75rem;
   margin-top: 0.75rem;
 }
@@ -736,6 +736,16 @@ body {
   -webkit-box-orient: vertical;
   overflow: hidden;
 }
+.compact-why {
+  font-size: 0.68rem;
+  color: #15803d;
+  font-style: italic;
+  margin: 4px 0 0;
+  display: -webkit-box;
+  -webkit-line-clamp: 3;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
 .compact-score {
   text-align: center;
   flex-shrink: 0;
@@ -762,7 +772,10 @@ body {
 }
 
 /* Responsive: stack columns on smaller screens */
-@media (max-width: 1200px) {
+@media (max-width: 1400px) {
+  .comparison-grid { grid-template-columns: repeat(3, 1fr); }
+}
+@media (max-width: 1000px) {
   .comparison-grid { grid-template-columns: repeat(2, 1fr); }
 }
 @media (max-width: 700px) {

@@ -1,4 +1,7 @@
 import os
+from dotenv import load_dotenv
+load_dotenv()  # Load .env file before any os.environ.get() calls
+
 import json
 import uuid
 import sqlite3
@@ -11,11 +14,12 @@ from flask_login import LoginManager, UserMixin, login_user, logout_user, login_
 from flask_bcrypt import Bcrypt
 import groq
 from google import genai as google_genai
+from openai import OpenAI as XAIClient
 from hybrid_engine import HybridEngine
 
 # ── App setup ──
 app = Flask(__name__)
-app.secret_key = os.environ.get("SECRET_KEY", "tastemate-secret-key-change-in-prod-2024")
+app.secret_key = os.environ.get("SECRET_KEY", "")
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.path.join(BASE_DIR, "data", "tastemate.db")
 
@@ -1128,7 +1132,10 @@ def recommend():
         # Only show course sections where user has at least one favorite
         # Strict same-course matching: Main Course → Main Course only
         fav_course_set = set(f.get("course", "") for f in fav_data)
+        # Appetizer↔Salad are siblings — if user has either, show both
         show_courses = set(fav_course_set)
+        if "Appetizer" in show_courses or "Salad" in show_courses:
+            show_courses |= {"Appetizer", "Salad"}
 
         courses_result = {}
         for course_name in COURSE_ORDER:
@@ -1190,8 +1197,9 @@ def recommend():
 #  LLM-BASED RECOMMENDATION ENGINE
 # ══════════════════════════════════════════════════════════════════════════════
 
-GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "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")
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "AIzaSyCb_RsQM3_GtobX3Bxx4U5CIoKSJWmWcAg")
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
+XAI_API_KEY = os.environ.get("XAI_API_KEY", "")
 
 
 def build_short_llm_prompt(fav_info, target_cuisine, dishes_by_course, dietary_pref):
@@ -1786,6 +1794,224 @@ def recommend_gemini():
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+#  X.AI (GROK) RECOMMENDATION ENGINE
+# ══════════════════════════════════════════════════════════════════════════════
+
+@app.route("/api/recommend-xai", methods=["POST"])
+@login_required
+def recommend_xai():
+    """x.AI Grok-powered recommendation endpoint."""
+    data = request.json
+    source_cuisine = data.get("source_cuisine", "")
+    favorite_names = data.get("favorite_dishes", [])
+    target_cuisines = data.get("target_cuisines", [])
+    taste_prefs = data.get("taste_preferences", {})
+
+    if not favorite_names or not target_cuisines:
+        return jsonify({"error": "Please select favorites and target cuisines"}), 400
+
+    api_key = XAI_API_KEY or data.get("api_key", "")
+    if not api_key:
+        return jsonify({"error": "x.AI API key not configured."}), 400
+
+    # ── 1. Gather favorite dish info ──
+    src_df = df[df["cuisine_name"].str.lower() == source_cuisine.lower()]
+    fav_df = src_df[src_df["dish_name"].isin(favorite_names)]
+
+    if fav_df.empty:
+        return jsonify({"error": "No matching favorite dishes found"}), 400
+
+    favorite_dishes_info = []
+    for _, row in fav_df.iterrows():
+        favorite_dishes_info.append({
+            "name": row["dish_name"],
+            "course": row["course_group"],
+            "sub_category": str(row.get("sub_category", "")),
+            "dietary_type": str(row.get("dietary_type", "")),
+            "main_ingredient_category": str(row.get("main_ingredient_category", "")),
+            "ingredients": str(row.get("ingredients", "")),
+        })
+
+    # Determine dietary preference (explicit or inferred)
+    dietary_pref = taste_prefs.get("dietary", "any")
+    if dietary_pref == "any":
+        fav_dietaries = [f["dietary_type"].lower() for f in favorite_dishes_info]
+        all_veg = all(_is_veg(d) for d in fav_dietaries)
+        if all_veg:
+            dietary_pref = "inferred_veg"
+
+    # Get unique courses from favorites
+    fav_courses = set(f["course"] for f in favorite_dishes_info)
+
+    # ── 2. Call x.AI Grok for each target cuisine ──
+    client = XAIClient(api_key=api_key, base_url="https://api.x.ai/v1")
+    recommendations = {}
+
+    for tc in target_cuisines:
+        tc_title = tc.title()
+
+        # Get available dishes for each course the user has favorites in
+        available_by_course = {}
+        for course in fav_courses:
+            dishes = get_available_dishes_by_course(
+                tc_title, course,
+                dietary_pref if dietary_pref != "inferred_veg" else "any",
+                allowed_proteins=taste_prefs.get("allowed_proteins", "any"),
+            )
+            if dishes:
+                available_by_course[course] = dishes
+
+        if not available_by_course:
+            recommendations[tc_title] = {"courses": {}, "error": "No matching dishes found"}
+            continue
+
+        # Build prompt (reuse the same prompt builder)
+        prompt = build_llm_prompt(favorite_dishes_info, tc_title, available_by_course, dietary_pref)
+
+        try:
+            response = client.chat.completions.create(
+                model="grok-3-mini-fast",
+                messages=[
+                    {"role": "system", "content": "You are a world-class food recommendation expert. Always respond with valid JSON only."},
+                    {"role": "user", "content": prompt},
+                ],
+                max_tokens=2000,
+                temperature=0.3,
+            )
+
+            response_text = response.choices[0].message.content.strip()
+
+            # Parse JSON from response (handle markdown code blocks)
+            if response_text.startswith("```"):
+                response_text = response_text.split("```")[1]
+                if response_text.startswith("json"):
+                    response_text = response_text[4:]
+                response_text = response_text.strip()
+
+            llm_result = json.loads(response_text)
+            llm_courses = llm_result.get("recommendations", {})
+
+            # Enrich with data from our DB — enforce course matching
+            valid_dishes_per_course = {}
+            for course_key, dish_list in available_by_course.items():
+                valid_dishes_per_course[course_key] = set(d["name"] for d in dish_list)
+
+            courses_result = {}
+            for course_name, dishes in llm_courses.items():
+                # Map LLM course name back to our course_group key
+                matched_course = None
+                for vc in valid_dishes_per_course:
+                    if vc.lower().rstrip('s') == course_name.lower().rstrip('s') or vc.lower() == course_name.lower():
+                        matched_course = vc
+                        break
+                if not matched_course:
+                    continue
+
+                enriched_dishes = []
+                for dish in dishes[:3]:
+                    dish_name = dish.get("dish_name", "")
+
+                    # Server-side enforcement: only accept dishes in this course
+                    if dish_name not in valid_dishes_per_course[matched_course]:
+                        app.logger.warning(f"xAI cross-course violation: '{dish_name}' not in {matched_course}, skipping")
+                        continue
+
+                    db_row = df[
+                        (df["cuisine_name"].str.lower() == tc.lower()) &
+                        (df["dish_name"] == dish_name)
+                    ]
+                    if not db_row.empty:
+                        r = db_row.iloc[0]
+                        enriched_dishes.append({
+                            "dish_name": dish_name,
+                            "score": dish.get("match_score", 0),
+                            "matched_favorite": dish.get("matched_favorite", ""),
+                            "matched_favorite_score": dish.get("match_score", 0),
+                            "why": dish.get("why", ""),
+                            "flavor_bridge": dish.get("flavor_bridge", ""),
+                            "course": course_name,
+                            "category": str(r.get("sub_category", "")),
+                            "dietary": str(r.get("dietary_type", "")),
+                            "protein": str(r.get("primary_protein", "")),
+                            "spice_level": str(r.get("spice_level", "")),
+                            "description": str(r.get("description", "")),
+                            "ingredients": str(r.get("ingredients", "")),
+                            "scoring": {"llm_match": dish.get("match_score", 0)},
+                            "flavor": {
+                                FLAVOR_LABELS.get(col, col): float(r[col])
+                                for col in FLAVOR_COLS
+                            },
+                        })
+                    else:
+                        enriched_dishes.append({
+                            "dish_name": dish_name,
+                            "score": dish.get("match_score", 0),
+                            "matched_favorite": dish.get("matched_favorite", ""),
+                            "matched_favorite_score": dish.get("match_score", 0),
+                            "why": dish.get("why", ""),
+                            "flavor_bridge": dish.get("flavor_bridge", ""),
+                            "course": course_name,
+                            "category": "", "dietary": "", "protein": "",
+                            "spice_level": "", "description": "", "ingredients": "",
+                            "scoring": {"llm_match": dish.get("match_score", 0)},
+                            "flavor": {},
+                        })
+                if enriched_dishes:
+                    courses_result[matched_course] = enriched_dishes
+
+            try:
+                c_sim = float(sim_df.loc[source_cuisine.title(), tc_title])
+            except KeyError:
+                c_sim = 0.0
+
+            recommendations[tc_title] = {
+                "cuisine_similarity": round(c_sim, 2),
+                "total_dishes_evaluated": sum(len(v) for v in available_by_course.values()),
+                "courses": courses_result,
+                "engine": "xai",
+            }
+
+        except json.JSONDecodeError as e:
+            recommendations[tc_title] = {
+                "courses": {},
+                "error": f"Failed to parse Grok response: {str(e)}",
+                "raw_response": response_text[:500] if 'response_text' in dir() else "",
+            }
+        except Exception as e:
+            recommendations[tc_title] = {
+                "courses": {},
+                "error": f"x.AI API error: {str(e)}",
+            }
+
+    # Build user profile for display
+    fav_vectors = fav_df[FLAVOR_COLS].values
+    weights = fav_df["dish_importance_score"].values
+    user_profile = np.average(fav_vectors, axis=0, weights=weights)
+    profile_dict = {FLAVOR_LABELS.get(col, col): round(float(user_profile[i]), 1) for i, col in enumerate(FLAVOR_COLS)}
+    favorites_with_courses = [{"name": f["name"], "course": f["course"]} for f in favorite_dishes_info]
+
+    log_audit(
+        current_user.id, current_user.username, "RECOMMENDATION_XAI",
+        source_cuisine=source_cuisine,
+        favorite_dishes=favorite_names,
+        taste_preferences=taste_prefs,
+        target_cuisines=target_cuisines,
+        recommendations={c: {k: [d["dish_name"] for d in ds] for k, ds in v.get("courses", {}).items()} for c, v in recommendations.items()},
+        user_profile_vector=profile_dict,
+    )
+
+    return jsonify({
+        "user_profile": profile_dict,
+        "source_cuisine": source_cuisine.title(),
+        "favorites_used": favorite_names,
+        "favorites_with_courses": favorites_with_courses,
+        "taste_preferences": taste_prefs,
+        "recommendations": recommendations,
+        "engine": "xai",
+    })
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 #  ROUTES — Audit
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -1913,7 +2139,7 @@ def recommend_hybrid():
                         "dietary": rec.get("dietary_type", ""),
                         "protein": rec.get("primary_protein", ""),
                         "description": rec.get("context_string", ""),
-                        "why": f"Flavor distance: {rec['flavor_distance']:.3f} | Cuisine similarity: {rec.get('cuisine_similarity', 0):.0%}",
+                        "why": rec.get("match_reason", f"Flavor distance: {rec['flavor_distance']:.3f}"),
                         "matched_favorite": fav,
                         "matched_favorite_score": rec["match_score"],
                         "course": cat,
