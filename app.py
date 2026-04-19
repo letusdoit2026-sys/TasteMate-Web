@@ -960,6 +960,13 @@ def recommend():
         elif dietary_pref == "pescatarian":
             tdf = tdf[tdf["dietary_type"].str.lower().isin(["veg", "vegan", "pescatarian"])]
 
+        # ── Vegetarian protein preference: hard-filter to veg/vegan ──
+        # Falls back to original tdf if no veg dishes exist for this cuisine.
+        if taste_prefs.get("prefer_vegetarian"):
+            tdf_veg = tdf[tdf["dietary_type"].str.lower().isin(["veg", "vegan", "vegetarian"])]
+            if not tdf_veg.empty:
+                tdf = tdf_veg
+
         # Protein filter — exclude meats the user doesn't eat
         allowed_proteins = taste_prefs.get("allowed_proteins", "any")
         if allowed_proteins != "any" and isinstance(allowed_proteins, list):
@@ -1128,30 +1135,30 @@ def recommend():
         all_scores.sort(key=lambda x: x["score"], reverse=True)
         scoring_log.sort(key=lambda x: x["final_score"], reverse=True)
 
-        # ── Group by course, pick top ITEMS_PER_COURSE per course ──
-        # Only show course sections where user has at least one favorite
-        # Strict same-course matching: Main Course → Main Course only
+        # (prefer_vegetarian was applied as a hard filter on tdf above)
+
+        # ── Pick top 3 overall per target cuisine, then group by course ──
+        # Strict same-course matching: only include dishes whose course has a favorite.
         fav_course_set = set(f.get("course", "") for f in fav_data)
         # Appetizer↔Salad are siblings — if user has either, show both
         show_courses = set(fav_course_set)
         if "Appetizer" in show_courses or "Salad" in show_courses:
             show_courses |= {"Appetizer", "Salad"}
 
+        eligible = [d for d in all_scores if d["course"] in show_courses]
+        top_overall = eligible[:3]
+
         courses_result = {}
         for course_name in COURSE_ORDER:
-            if course_name not in show_courses:
-                continue
-            course_dishes = [d for d in all_scores if d["course"] == course_name]
+            course_dishes = [d for d in top_overall if d["course"] == course_name]
             if not course_dishes:
                 continue
-            top_dishes = course_dishes[:ITEMS_PER_COURSE]
-            # Add similar alternatives
-            for dish in top_dishes:
+            for dish in course_dishes:
                 dish_vec = np.array([dish["flavor"].get(FLAVOR_LABELS.get(c, c), 0) for c in FLAVOR_COLS])
                 dish["similar_alternatives"] = find_similar_alternatives(
                     dish["dish_name"], dish_vec, all_scores
                 )
-            courses_result[course_name] = top_dishes
+            courses_result[course_name] = course_dishes
 
         recommendations[tc_title] = {
             "cuisine_similarity": round(c_sim, 2),
@@ -2085,6 +2092,12 @@ def recommend_hybrid():
     dietary = taste_prefs.get("dietary", "")
     allowed_proteins = taste_prefs.get("allowed_proteins", "any")
 
+    # prefer_vegetarian (from Protein Preferences) hard-filters to veg/vegan dishes.
+    # If no veg results come back for a cuisine, we fall back to the user's original
+    # dietary preference for that cuisine only.
+    prefer_veg = bool(taste_prefs.get("prefer_vegetarian"))
+    engine_dietary = "veg" if prefer_veg else dietary
+
     if not favorite_dishes:
         return jsonify({"error": "No favorite dishes provided."})
 
@@ -2108,28 +2121,17 @@ def recommend_hybrid():
         course = info["category"] if info else "—"
         favorites_with_courses.append({"name": fav, "course": course})
 
-    # Run hybrid pipeline: top 3 per favorite, per target cuisine
-    all_recommendations = {}
-    for tc in target_cuisines:
-        tc_title = tc.strip().title()
-        # Cuisine similarity
-        c_sim = 0.0
-        if hybrid_engine.sim_df is not None:
-            try:
-                c_sim = float(hybrid_engine.sim_df.loc[source_cuisine.title(), tc_title])
-            except (KeyError, ValueError):
-                c_sim = 0.0
-
-        courses_dict = {}
-        total_evaluated = 0
-
+    def _collect_for_cuisine(tc, dietary_arg):
+        """Run the hybrid pipeline for one target cuisine and return courses_dict + counters."""
+        courses_dict_local = {}
+        total_eval = 0
         for fav in favorite_dishes:
             result = hybrid_engine.get_recommendations(
                 seed_dish=fav,
-                user_preferences={"dietary": dietary, "target_cuisine": tc, "discovery_mode": True, "allowed_proteins": allowed_proteins},
+                user_preferences={"dietary": dietary_arg, "target_cuisine": tc, "discovery_mode": True, "allowed_proteins": allowed_proteins},
             )
             if isinstance(result, dict) and "recommendations" in result:
-                total_evaluated += result.get("pipeline_stats", {}).get("after_hard_filter", 0)
+                total_eval += result.get("pipeline_stats", {}).get("after_hard_filter", 0)
                 for rec in result["recommendations"]:
                     cat = rec.get("category", "Main Course")
                     dish_entry = {
@@ -2157,19 +2159,37 @@ def recommend_hybrid():
                             "dietary_compat": 100,
                         },
                     }
-                    if cat not in courses_dict:
-                        courses_dict[cat] = []
-                    courses_dict[cat].append(dish_entry)
-
-        # Deduplicate and sort within each course
-        for cat in courses_dict:
+                    if cat not in courses_dict_local:
+                        courses_dict_local[cat] = []
+                    courses_dict_local[cat].append(dish_entry)
+        # Dedupe + sort within each course
+        for cat in courses_dict_local:
             seen = set()
             unique = []
-            for d in sorted(courses_dict[cat], key=lambda x: x["score"], reverse=True):
+            for d in sorted(courses_dict_local[cat], key=lambda x: x["score"], reverse=True):
                 if d["dish_name"] not in seen:
                     seen.add(d["dish_name"])
                     unique.append(d)
-            courses_dict[cat] = unique
+            courses_dict_local[cat] = unique
+        return courses_dict_local, total_eval
+
+    # Run hybrid pipeline: top 3 per favorite, per target cuisine
+    all_recommendations = {}
+    for tc in target_cuisines:
+        tc_title = tc.strip().title()
+        # Cuisine similarity
+        c_sim = 0.0
+        if hybrid_engine.sim_df is not None:
+            try:
+                c_sim = float(hybrid_engine.sim_df.loc[source_cuisine.title(), tc_title])
+            except (KeyError, ValueError):
+                c_sim = 0.0
+
+        courses_dict, total_evaluated = _collect_for_cuisine(tc, engine_dietary)
+
+        # Vegetarian preference: if veg-only returned nothing, fall back to original dietary
+        if prefer_veg and not any(courses_dict.get(c) for c in courses_dict):
+            courses_dict, total_evaluated = _collect_for_cuisine(tc, dietary)
 
         all_recommendations[tc] = {
             "cuisine_similarity": c_sim,
@@ -2185,6 +2205,730 @@ def recommend_hybrid():
         "favorites_with_courses": favorites_with_courses,
         "user_profile": user_profile,
         "recommendations": all_recommendations,
+    })
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  HYBRID 2.0 — Grok-cached recommendations filtered by user preferences
+# ══════════════════════════════════════════════════════════════════════════════
+
+_grok_enriched_df = None
+
+
+def _load_grok_enriched():
+    """Load grok_recommendations.csv and enrich with authoritative metadata.
+    Cached in memory after first call.
+    """
+    global _grok_enriched_df
+    if _grok_enriched_df is not None:
+        return _grok_enriched_df
+
+    grok_path = os.path.join(os.path.dirname(__file__), "data", "grok_recommendations.csv")
+    meta_path = os.path.join(os.path.dirname(__file__), "data", "Metadata_Filters.csv")
+    if not os.path.exists(grok_path):
+        return None
+
+    import pandas as pd
+    grok = pd.read_csv(grok_path)
+    grok["recommended_dish"] = grok["recommended_dish"].astype(str).str.strip()
+    grok["target_cuisine"]   = grok["target_cuisine"].astype(str).str.strip()
+    grok["dish_name"]        = grok["dish_name"].astype(str).str.strip()
+    grok["cuisine"]          = grok["cuisine"].astype(str).str.strip()
+
+    meta = pd.read_csv(meta_path)
+    meta = meta[meta["dish_name"] != "dish_name"].copy()
+    meta["dish_name"] = meta["dish_name"].astype(str).str.strip()
+    meta["cuisine"]   = meta["cuisine"].astype(str).str.strip()
+
+    # Join Grok recs against authoritative metadata (by recommended_dish + target_cuisine)
+    meta_renamed = meta[["dish_name", "cuisine", "category", "dietary_type", "primary_protein"]].rename(
+        columns={
+            "dish_name": "recommended_dish",
+            "cuisine": "target_cuisine",
+            "category": "meta_category",
+            "dietary_type": "meta_dietary_type",
+            "primary_protein": "meta_primary_protein",
+        }
+    )
+    enriched = grok.merge(meta_renamed, on=["recommended_dish", "target_cuisine"], how="left")
+    _grok_enriched_df = enriched
+    return enriched
+
+
+@app.route("/api/recommend-hybrid-v2", methods=["POST"])
+@login_required
+def recommend_hybrid_v2():
+    """Hybrid 2.0 — Grok-cached top-10 with user-preference filtering.
+
+    For each favorite × target cuisine:
+      1. Look up Grok's top 10 in grok_recommendations.csv
+      2. Enrich with authoritative metadata (dietary_type, primary_protein, category)
+      3. Filter by user dietary + allowed_proteins
+      4. Return top 3 survivors
+    """
+    df = _load_grok_enriched()
+    if df is None:
+        return jsonify({"error": "Hybrid 2.0 cache not available. data/grok_recommendations.csv missing."}), 503
+
+    data = request.json
+    source_cuisine  = data.get("source_cuisine", "")
+    favorite_dishes = data.get("favorite_dishes", [])
+    target_cuisines = data.get("target_cuisines", [])
+    taste_prefs     = data.get("taste_preferences", {})
+    dietary         = str(taste_prefs.get("dietary", "")).strip().lower()
+    allowed_proteins = taste_prefs.get("allowed_proteins", "any")
+
+    if not favorite_dishes:
+        return jsonify({"error": "No favorite dishes provided."})
+
+    # ── Protein whitelist (reuse hybrid engine's grouping) ──
+    from hybrid_engine import PROTEIN_GROUPS
+    allowed_protein_values = None
+    if allowed_proteins != "any" and isinstance(allowed_proteins, list):
+        allowed_protein_values = set()
+        for group_key in allowed_proteins:
+            if group_key in PROTEIN_GROUPS:
+                allowed_protein_values |= PROTEIN_GROUPS[group_key]
+
+    # prefer_vegetarian (from Protein Preferences) hard-filters Grok's candidates to
+    # veg/vegan. If no veg candidates exist for a favorite, we fall back per-favorite.
+    # Belt-and-suspenders: also trigger if user picked Veg/Vegan in Diet Preferences.
+    prefer_veg = bool(taste_prefs.get("prefer_vegetarian")) or dietary in ("veg", "vegan", "vegetarian")
+    print(f"[hybrid-v2] taste_prefs={taste_prefs} → prefer_veg={prefer_veg}", flush=True)
+
+    def is_veg_dish(diet_val):
+        d = str(diet_val or "").strip().lower()
+        return d in ("veg", "vegan", "vegetarian")
+
+    def dietary_ok(diet_val):
+        if not dietary or dietary == "any":
+            return True
+        d = str(diet_val or "").strip().lower()
+        if dietary == "vegan":
+            return d == "vegan"
+        if dietary in ("veg", "vegetarian"):
+            return d in ("veg", "vegan", "vegetarian")
+        if dietary == "pescatarian":
+            return d in ("veg", "vegan", "vegetarian", "pescatarian")
+        return True
+
+    def protein_ok(diet_val, protein_val):
+        d = str(diet_val or "").strip().lower()
+        # Veg/vegan dishes always OK (no meat)
+        if d in ("veg", "vegan", "vegetarian"):
+            return True
+        # No protein restriction set → allow all
+        if allowed_protein_values is None:
+            return True
+        # Missing protein info → allow (be permissive)
+        p = str(protein_val or "").strip()
+        if not p or p.lower() in ("nan", "none", ""):
+            return True
+        return p in allowed_protein_values
+
+    # ── Favorites with courses (for display) ──
+    favorites_with_courses = []
+    for fav in favorite_dishes:
+        info = hybrid_engine.get_dish_info(fav) if hybrid_engine else None
+        course = info["category"] if info else "—"
+        favorites_with_courses.append({"name": fav, "course": course})
+
+    # ── Build user flavor profile (average of seed flavor vectors) ──
+    user_profile = {}
+    if hybrid_engine:
+        from hybrid_engine import FLAVOR_DIMS as HF_DIMS
+        fav_vectors = []
+        for fav in favorite_dishes:
+            info = hybrid_engine.get_dish_info(fav)
+            if info and "flavor" in info:
+                fav_vectors.append(info["flavor"])
+        if fav_vectors:
+            for dim in HF_DIMS:
+                vals = [v[dim] for v in fav_vectors if dim in v]
+                user_profile[dim] = round(sum(vals) / len(vals), 2) if vals else 0.0
+
+    # ── Main loop: per target cuisine ──
+    all_recommendations = {}
+    import pandas as pd
+    for tc in target_cuisines:
+        tc_title = tc.strip().title()
+
+        # Cuisine similarity
+        c_sim = 0.0
+        if hybrid_engine and hybrid_engine.sim_df is not None:
+            try:
+                c_sim = float(hybrid_engine.sim_df.loc[source_cuisine.title(), tc_title])
+            except (KeyError, ValueError):
+                c_sim = 0.0
+
+        courses_dict = {}
+        total_evaluated = 0
+
+        for fav in favorite_dishes:
+            # Pull all 10 Grok recommendations for this favorite → target
+            sub = df[(df["dish_name"] == fav) & (df["target_cuisine"].str.lower() == tc_title.lower())].copy()
+            sub = sub.sort_values("rank")
+            total_evaluated += len(sub)
+
+            # First pass: collect all candidates that pass filters (no limit yet)
+            candidates = []
+            for _, row in sub.iterrows():
+                # Prefer authoritative metadata; fallback to Grok-reported values
+                diet = row.get("meta_dietary_type")
+                if pd.isna(diet) or not str(diet).strip():
+                    diet = row.get("dietary_type", "")
+                protein = row.get("meta_primary_protein")
+                if pd.isna(protein) or not str(protein).strip():
+                    protein = ""  # unknown
+                cat = row.get("meta_category")
+                if pd.isna(cat) or not str(cat).strip():
+                    cat = row.get("course", "Main Course")
+
+                if not dietary_ok(diet):
+                    continue
+                if not protein_ok(diet, protein):
+                    continue
+
+                # Gaussian-style score from confidence (0-99 → ~0-99)
+                confidence = row.get("confidence", 0)
+                try:
+                    confidence_f = float(confidence)
+                except (ValueError, TypeError):
+                    confidence_f = 0.0
+                match_score_raw = row.get("match_score", 0)
+                try:
+                    score_0_100 = float(match_score_raw) * 10.0  # 9.6 → 96.0
+                except (ValueError, TypeError):
+                    score_0_100 = confidence_f
+
+                dish_entry = {
+                    "dish_name": row["recommended_dish"],
+                    "score": round(score_0_100, 1),
+                    "category": str(cat),
+                    "dietary": str(diet),
+                    "protein": str(protein),
+                    "description": "",
+                    "why": str(row.get("why_it_matches", "")),
+                    "matched_favorite": fav,
+                    "matched_favorite_score": round(score_0_100, 1),
+                    "course": str(cat),
+                    "spice_level": "",
+                    "ingredients": "",
+                    "confidence": int(confidence_f),
+                    "grok_rank": int(row.get("rank", 0) or 0),
+                    "scoring": {
+                        "cosine_sim": round(score_0_100, 1),
+                        "cooking_method": 0,
+                        "ingredient_match": 0,
+                        "temperature_match": 0,
+                        "ingredient_category": 0,
+                        "dietary_compat": 100,
+                    },
+                }
+                candidates.append(dish_entry)
+
+            # Vegetarian preference: hard-filter to veg/vegan candidates from Grok's pool.
+            # If THIS favorite's pool has zero veg (typical when seed is a meat dish),
+            # fall back to top-scoring veg dishes for the target cuisine across ALL
+            # Grok rows (any source seed) — this guarantees veg-only output.
+            if prefer_veg:
+                veg_only = [c for c in candidates if is_veg_dish(c.get("dietary", ""))]
+                if veg_only:
+                    pool = veg_only
+                else:
+                    # Cross-seed veg fallback for this target cuisine
+                    cross = df[df["target_cuisine"].str.lower() == tc_title.lower()].copy()
+                    # Use authoritative metadata when available
+                    diet_series = cross["meta_dietary_type"].where(
+                        cross["meta_dietary_type"].notna() & (cross["meta_dietary_type"].astype(str).str.strip() != ""),
+                        cross["dietary_type"]
+                    )
+                    veg_mask = diet_series.astype(str).str.strip().str.lower().isin(["veg", "vegan", "vegetarian"])
+                    veg_cross = cross[veg_mask].copy()
+                    # Best score wins, dedupe by recommended_dish
+                    veg_cross["score_sort"] = pd.to_numeric(veg_cross["match_score"], errors="coerce").fillna(0)
+                    veg_cross = veg_cross.sort_values("score_sort", ascending=False)
+                    veg_cross = veg_cross.drop_duplicates(subset=["recommended_dish"], keep="first")
+                    pool = []
+                    for _, vrow in veg_cross.head(20).iterrows():
+                        d2 = vrow.get("meta_dietary_type") if pd.notna(vrow.get("meta_dietary_type")) and str(vrow.get("meta_dietary_type")).strip() else vrow.get("dietary_type", "")
+                        cat2 = vrow.get("meta_category") if pd.notna(vrow.get("meta_category")) and str(vrow.get("meta_category")).strip() else vrow.get("course", "Main Course")
+                        prot2 = vrow.get("meta_primary_protein") if pd.notna(vrow.get("meta_primary_protein")) and str(vrow.get("meta_primary_protein")).strip() else ""
+                        try:
+                            sc = float(vrow.get("match_score", 0)) * 10.0
+                        except (ValueError, TypeError):
+                            sc = 0.0
+                        pool.append({
+                            "dish_name":        vrow["recommended_dish"],
+                            "score":            round(sc, 1),
+                            "category":         str(cat2),
+                            "dietary":          str(d2),
+                            "protein":          str(prot2),
+                            "description":      "",
+                            "why":              str(vrow.get("why_it_matches", "")) + f" (veg fallback — meat seed '{fav}' had no veg matches in Grok cache)",
+                            "matched_favorite": fav,
+                            "matched_favorite_score": round(sc, 1),
+                            "course":           str(cat2),
+                            "spice_level":      "",
+                            "ingredients":      "",
+                            "confidence":       int(float(vrow.get("confidence", 0) or 0)),
+                            "grok_rank":        int(vrow.get("rank", 0) or 0),
+                            "scoring":          {"cosine_sim": round(sc, 1), "cooking_method": 0, "ingredient_match": 0,
+                                                 "temperature_match": 0, "ingredient_category": 0, "dietary_compat": 100},
+                        })
+            else:
+                pool = candidates
+
+            # Pool is in priority order. Take top 3.
+            for dish_entry in pool[:3]:
+                cat = dish_entry["course"]
+                if cat not in courses_dict:
+                    courses_dict[cat] = []
+                courses_dict[cat].append(dish_entry)
+
+        # Dedupe and sort within each course by score
+        for cat in courses_dict:
+            seen = set()
+            unique = []
+            for d in sorted(courses_dict[cat], key=lambda x: -x["score"]):
+                if d["dish_name"] not in seen:
+                    seen.add(d["dish_name"])
+                    unique.append(d)
+            courses_dict[cat] = unique
+
+        all_recommendations[tc] = {
+            "cuisine_similarity": c_sim,
+            "total_dishes_evaluated": total_evaluated,
+            "courses": courses_dict,
+        }
+
+    return jsonify({
+        "engine": "hybrid-v2",
+        "source_cuisine": source_cuisine,
+        "favorites_used": favorite_dishes,
+        "taste_preferences": taste_prefs,
+        "favorites_with_courses": favorites_with_courses,
+        "user_profile": user_profile,
+        "recommendations": all_recommendations,
+        "prefer_vegetarian_applied": prefer_veg,
+    })
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  HYBRID 3.0 — Facet-ontology overlap engine
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# Reads data/dish_facets.csv (one row per dish, ~19 facet fields generated by
+# scripts/generate_dish_facets.py). At query time, scores each candidate dish
+# in the target cuisine by counting facet overlaps with the seed favorite,
+# weighted by importance. Honours all user filters (dietary, allowed_proteins,
+# prefer_vegetarian) as hard pre-filters on the candidate pool — so no need
+# for fallbacks: we always search the ENTIRE valid candidate set.
+
+_facets_df = None
+
+def _load_facets():
+    """Load and cache dish_facets.csv joined with Metadata_Filters.csv."""
+    global _facets_df
+    if _facets_df is not None:
+        return _facets_df
+
+    facets_path = os.path.join(os.path.dirname(__file__), "data", "dish_facets.csv")
+    meta_path   = os.path.join(os.path.dirname(__file__), "data", "Metadata_Filters.csv")
+    if not os.path.exists(facets_path):
+        return None
+
+    import pandas as pd
+    fdf = pd.read_csv(facets_path)
+    fdf["dish_name"] = fdf["dish_name"].astype(str).str.strip()
+    fdf["cuisine"]   = fdf["cuisine"].astype(str).str.strip()
+
+    meta = pd.read_csv(meta_path)
+    meta = meta[meta["dish_name"] != "dish_name"].copy()
+    meta["dish_name"] = meta["dish_name"].astype(str).str.strip()
+    meta["cuisine"]   = meta["cuisine"].astype(str).str.strip()
+
+    enriched = fdf.merge(
+        meta[["dish_name", "cuisine", "category", "dietary_type", "primary_protein"]],
+        on=["dish_name", "cuisine"], how="left",
+    )
+    _facets_df = enriched
+    return enriched
+
+
+def _parse_list(val):
+    """Parse a CSV cell into a list — handles JSON arrays and bare strings."""
+    if val is None:
+        return []
+    s = str(val).strip()
+    if not s or s.lower() in ("nan", "none"):
+        return []
+    if s.startswith("["):
+        try:
+            parsed = json.loads(s)
+            return [str(x).strip().lower() for x in parsed if x]
+        except (json.JSONDecodeError, ValueError):
+            pass
+    # Comma-separated fallback
+    return [p.strip().lower() for p in s.split(",") if p.strip()]
+
+
+def _parse_dict(val):
+    """Parse a JSON-object cell. Returns {} on any failure."""
+    if val is None:
+        return {}
+    s = str(val).strip()
+    if not s or s.lower() in ("nan", "none"):
+        return {}
+    try:
+        parsed = json.loads(s)
+        return parsed if isinstance(parsed, dict) else {}
+    except (json.JSONDecodeError, ValueError):
+        return {}
+
+
+def _facet_overlap_score(seed_row, cand_row, dietary_pref):
+    """Compute facet-overlap score between seed and candidate.
+
+    Returns: (score: float, matched_facets: list[str])
+    """
+    score = 0.0
+    matched = []
+
+    # ── Cooking methods (heavy weight) ──
+    seed_cm = set(_parse_list(seed_row.get("cooking_methods")))
+    cand_cm = set(_parse_list(cand_row.get("cooking_methods")))
+    cm_overlap = seed_cm & cand_cm
+    if cm_overlap:
+        score += 3 * len(cm_overlap)
+        matched.append(f"cooking:{','.join(sorted(cm_overlap))}")
+
+    # ── Flavor anchors (heavy) ──
+    seed_fa = set(_parse_list(seed_row.get("flavor_anchors")))
+    cand_fa = set(_parse_list(cand_row.get("flavor_anchors")))
+    fa_overlap = seed_fa & cand_fa
+    if fa_overlap:
+        score += 3 * len(fa_overlap)
+        matched.append(f"flavor:{','.join(sorted(fa_overlap))}")
+
+    # ── Texture profile ──
+    seed_tx = set(_parse_list(seed_row.get("texture_profile")))
+    cand_tx = set(_parse_list(cand_row.get("texture_profile")))
+    tx_overlap = seed_tx & cand_tx
+    if tx_overlap:
+        score += 2 * len(tx_overlap)
+        matched.append(f"texture:{','.join(sorted(tx_overlap))}")
+
+    # ── Single-value matches ──
+    for facet, weight in [
+        ("marinade_family", 2),
+        ("course_role", 2),
+        ("heat_intensity", 2),
+        ("spice_lineage", 2),
+        ("fat_character", 2),
+        ("aromatic_signature", 1),
+        ("portion_format", 1),
+        ("richness", 1),
+        ("preparation_complexity", 1),
+        ("dominant_color", 1),
+        ("visual_appeal", 1),
+        ("sauce_role", 1),
+    ]:
+        sv = str(seed_row.get(facet, "")).strip().lower()
+        cv = str(cand_row.get(facet, "")).strip().lower()
+        if sv and cv and sv == cv and sv != "none":
+            score += weight
+            matched.append(f"{facet}:{sv}")
+
+    # ── Cultural kin (lightweight) ──
+    seed_ck = set(_parse_list(seed_row.get("cultural_kin")))
+    cand_ck = set(_parse_list(cand_row.get("cultural_kin")))
+    ck_overlap = seed_ck & cand_ck
+    if ck_overlap:
+        score += 1 * len(ck_overlap)
+        matched.append(f"cultural-kin:{','.join(sorted(ck_overlap))}")
+
+    # ── Meal occasion ──
+    seed_mo = set(_parse_list(seed_row.get("meal_occasion")))
+    cand_mo = set(_parse_list(cand_row.get("meal_occasion")))
+    mo_overlap = seed_mo & cand_mo
+    if mo_overlap:
+        score += 1 * len(mo_overlap)
+        matched.append(f"occasion:{','.join(sorted(mo_overlap))}")
+
+    # ── Substitution-class boost (the killer field) ──
+    # If seed explicitly names this candidate (or its name-substring) under the
+    # user's dietary class, give a heavy bonus.
+    sub_class = _parse_dict(seed_row.get("substitution_class"))
+    cand_name_low = str(cand_row.get("dish_name", "")).strip().lower()
+    sub_keys_to_check = ["any"]
+    if dietary_pref in ("veg", "vegetarian", "prefer-veg"):
+        sub_keys_to_check = ["veg", "vegan", "any"]
+    elif dietary_pref == "vegan":
+        sub_keys_to_check = ["vegan", "any"]
+    elif dietary_pref == "pescatarian":
+        sub_keys_to_check = ["fish", "veg", "vegan", "any"]
+
+    for k in sub_keys_to_check:
+        for sub_hint in sub_class.get(k, []) or []:
+            hint_low = str(sub_hint).strip().lower().replace("-", " ")
+            if hint_low and (hint_low in cand_name_low or
+                             any(tok in cand_name_low for tok in hint_low.split() if len(tok) > 3)):
+                score += 5
+                matched.append(f"named-substitute({k}):{sub_hint}")
+                break  # one bonus per dietary class
+
+    # ── Serving temperature: penalty on mismatch ──
+    st_seed = str(seed_row.get("serving_temperature", "")).strip().lower()
+    st_cand = str(cand_row.get("serving_temperature", "")).strip().lower()
+    if st_seed and st_cand and st_seed != st_cand:
+        # cold↔hot is a bigger mismatch than warm↔hot
+        if {st_seed, st_cand} in ({"cold", "hot"}, {"hot", "cold"}):
+            score -= 4
+            matched.append(f"temp-mismatch:{st_seed}→{st_cand}")
+        else:
+            score -= 1
+
+    # ── Protein affinity (new) ──
+    # Facets describe how a dish is made/eaten; they don't carry protein signal.
+    # Without this bonus, a chicken-curry seed scores a Greek chickpea stew nearly
+    # as high as a Greek chicken stew because stew-ness dominates the shared
+    # facets. Reward same-protein and same-protein-group matches so real chicken
+    # picks win ties within the candidate pool.
+    sp = str(seed_row.get("primary_protein", "") or "").strip()
+    cp = str(cand_row.get("primary_protein", "") or "").strip()
+    if sp and cp and sp.lower() not in ("nan", "none") and cp.lower() not in ("nan", "none"):
+        if sp == cp:
+            score += 4
+            matched.append(f"protein-match:{sp}")
+        else:
+            try:
+                from hybrid_engine import PROTEIN_GROUPS
+                for group_vals in PROTEIN_GROUPS.values():
+                    if sp in group_vals and cp in group_vals:
+                        score += 2
+                        matched.append(f"protein-kin:{sp}↔{cp}")
+                        break
+            except Exception:
+                pass
+
+    return score, matched
+
+
+@app.route("/api/recommend-hybrid-v3", methods=["POST"])
+@login_required
+def recommend_hybrid_v3():
+    """Hybrid 3.0 — Facet-ontology overlap engine.
+
+    For each (favorite, target_cuisine):
+      1. Look up seed dish in dish_facets.csv
+      2. Pull all target-cuisine candidates that satisfy user filters (hard)
+      3. Score each by facet overlap with seed
+      4. Return top 3 with structured "why" listing matched facets
+    """
+    fdf = _load_facets()
+    if fdf is None:
+        return jsonify({"error": "Hybrid 3.0 cache not available. Run scripts/generate_dish_facets.py first."}), 503
+
+    data = request.json
+    source_cuisine  = data.get("source_cuisine", "")
+    favorite_dishes = data.get("favorite_dishes", [])
+    target_cuisines = data.get("target_cuisines", [])
+    taste_prefs     = data.get("taste_preferences", {})
+    dietary         = str(taste_prefs.get("dietary", "")).strip().lower()
+    allowed_proteins = taste_prefs.get("allowed_proteins", "any")
+
+    if not favorite_dishes:
+        return jsonify({"error": "No favorite dishes provided."})
+
+    prefer_veg = bool(taste_prefs.get("prefer_vegetarian")) or dietary in ("veg", "vegan", "vegetarian")
+    print(f"[hybrid-v3] taste_prefs={taste_prefs} → prefer_veg={prefer_veg}", flush=True)
+
+    # ── Protein whitelist ──
+    from hybrid_engine import PROTEIN_GROUPS
+    allowed_protein_values = None
+    if allowed_proteins != "any" and isinstance(allowed_proteins, list):
+        allowed_protein_values = set()
+        for gk in allowed_proteins:
+            if gk in PROTEIN_GROUPS:
+                allowed_protein_values |= PROTEIN_GROUPS[gk]
+
+    def is_veg(diet_val):
+        d = str(diet_val or "").strip().lower()
+        return d in ("veg", "vegan", "vegetarian")
+
+    def passes_dietary(diet_val):
+        d = str(diet_val or "").strip().lower()
+        if prefer_veg:
+            return d in ("veg", "vegan", "vegetarian")
+        if dietary == "vegan":
+            return d == "vegan"
+        if dietary in ("veg", "vegetarian"):
+            return d in ("veg", "vegan", "vegetarian")
+        if dietary == "pescatarian":
+            return d in ("veg", "vegan", "vegetarian", "pescatarian")
+        return True
+
+    def passes_protein(diet_val, protein_val):
+        # "Any / No Preference" → admit everything
+        if allowed_protein_values is None:
+            return True
+        # The allowed-proteins list is a MEAT whitelist. Veg/vegan dishes
+        # don't carry meat, so the list doesn't apply to them — admit. This
+        # also lets dessert, salad, and side-dish candidates (often veg, with
+        # proteins like Milk/Walnuts/Semolina) reach the pool for veg seeds
+        # like Gajar Ka Halwa without being blocked by the chicken whitelist.
+        # Leakage of veg main-courses into a chicken-seed query is prevented
+        # downstream by the category gate and the protein-affinity bonus.
+        if is_veg(diet_val):
+            return True
+        p = str(protein_val or "").strip()
+        if not p or p.lower() in ("nan", "none", ""):
+            return True  # unknown protein → admit; scoring will sort it out
+        return p in allowed_protein_values
+
+    # ── Favorites with courses (display) ──
+    favorites_with_courses = []
+    for fav in favorite_dishes:
+        info = hybrid_engine.get_dish_info(fav) if hybrid_engine else None
+        course = info["category"] if info else "—"
+        favorites_with_courses.append({"name": fav, "course": course})
+
+    # ── User flavor profile (display only — reused from seed flavor avg) ──
+    user_profile = {}
+    if hybrid_engine:
+        from hybrid_engine import FLAVOR_DIMS as HF_DIMS
+        fav_vectors = []
+        for fav in favorite_dishes:
+            info = hybrid_engine.get_dish_info(fav)
+            if info and "flavor" in info:
+                fav_vectors.append(info["flavor"])
+        if fav_vectors:
+            for dim in HF_DIMS:
+                vals = [v[dim] for v in fav_vectors if dim in v]
+                user_profile[dim] = round(sum(vals) / len(vals), 2) if vals else 0.0
+
+    import pandas as pd
+
+    all_recommendations = {}
+
+    for tc in target_cuisines:
+        tc_title = tc.strip().title()
+
+        c_sim = 0.0
+        if hybrid_engine and hybrid_engine.sim_df is not None:
+            try:
+                c_sim = float(hybrid_engine.sim_df.loc[source_cuisine.title(), tc_title])
+            except (KeyError, ValueError):
+                c_sim = 0.0
+
+        # Candidate pool: target cuisine, hard-filter by dietary + protein
+        pool = fdf[fdf["cuisine"].str.lower() == tc_title.lower()].copy()
+        if pool.empty:
+            all_recommendations[tc] = {"cuisine_similarity": c_sim, "courses": {}, "total_dishes_evaluated": 0}
+            continue
+
+        keep_mask = pool.apply(
+            lambda r: passes_dietary(r.get("dietary_type", "")) and
+                      passes_protein(r.get("dietary_type", ""), r.get("primary_protein", "")),
+            axis=1,
+        )
+        pool = pool[keep_mask]
+
+        total_eval = len(pool)
+        courses_dict = {}
+
+        def _norm_cat(c):
+            """Normalise category strings so 'Main' and 'Main Course' compare equal."""
+            c = str(c or "").strip().lower()
+            if c in ("main", "main course", "mains"):
+                return "main course"
+            return c
+
+        for fav in favorite_dishes:
+            seed_rows = fdf[fdf["dish_name"] == fav]
+            if seed_rows.empty:
+                continue
+            seed = seed_rows.iloc[0].to_dict()
+            seed_cat = _norm_cat(seed.get("category"))
+
+            # Score every candidate whose category matches the seed's.
+            # Without this gate, facet-overlap alone lets non-dessert "stew-like
+            # comfort bowls" (e.g. Avgolemono Soup, Moussaka) leak into dessert
+            # recommendations for a dessert seed (e.g. Gajar Ka Halwa).
+            scored = []
+            for _, cand in pool.iterrows():
+                if cand["dish_name"] == fav and str(cand["cuisine"]).lower() == source_cuisine.lower():
+                    continue  # skip self
+                # Category gate — only pair like-with-like courses.
+                # If seed has no category label, fall through (no gate).
+                if seed_cat and _norm_cat(cand.get("category")) != seed_cat:
+                    continue
+                s, matched = _facet_overlap_score(seed, cand, "veg" if prefer_veg else dietary)
+                if s <= 0:
+                    continue
+                scored.append((s, matched, cand))
+
+            scored.sort(key=lambda x: x[0], reverse=True)
+
+            for s, matched, cand in scored[:3]:
+                cat = str(cand.get("category", "") or "Main Course").strip() or "Main Course"
+                # Score scaling: facet score → 0-100 display.
+                # Typical strong matches land around 15-25; cap at 100.
+                display_score = min(100, round(s * 4, 1))
+                why_text = " · ".join(matched[:5]) if matched else f"Facet overlap score: {s:.1f}"
+                dish_entry = {
+                    "dish_name":        str(cand["dish_name"]),
+                    "score":            display_score,
+                    "category":         cat,
+                    "dietary":          str(cand.get("dietary_type", "")),
+                    "protein":          str(cand.get("primary_protein", "") or ""),
+                    "description":      "",
+                    "why":              why_text,
+                    "matched_favorite": fav,
+                    "matched_favorite_score": display_score,
+                    "course":           cat,
+                    "spice_level":      "",
+                    "ingredients":      "",
+                    "facet_overlap":    round(s, 2),
+                    "facet_matches":    matched,
+                    "scoring": {
+                        "cosine_sim":          display_score,
+                        "cooking_method":      0,
+                        "ingredient_match":    0,
+                        "temperature_match":   0,
+                        "ingredient_category": 0,
+                        "dietary_compat":      100,
+                    },
+                }
+                if cat not in courses_dict:
+                    courses_dict[cat] = []
+                courses_dict[cat].append(dish_entry)
+
+        # Dedupe within each course, keep highest-score occurrence
+        for cat in courses_dict:
+            seen = {}
+            for d in courses_dict[cat]:
+                name = d["dish_name"]
+                if name not in seen or d["score"] > seen[name]["score"]:
+                    seen[name] = d
+            courses_dict[cat] = sorted(seen.values(), key=lambda x: -x["score"])
+
+        all_recommendations[tc] = {
+            "cuisine_similarity": c_sim,
+            "total_dishes_evaluated": total_eval,
+            "courses": courses_dict,
+        }
+
+    return jsonify({
+        "engine": "hybrid-v3",
+        "source_cuisine": source_cuisine,
+        "favorites_used": favorite_dishes,
+        "taste_preferences": taste_prefs,
+        "favorites_with_courses": favorites_with_courses,
+        "user_profile": user_profile,
+        "recommendations": all_recommendations,
+        "prefer_vegetarian_applied": prefer_veg,
     })
 
 

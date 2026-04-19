@@ -41,6 +41,7 @@ FLAVOR_WEIGHT = 2.0          # Step 4: multiply flavor distance weight vs semant
 DISCOVERY_BONUS = 0.10       # Step 5: 10% distance reduction
 DISCOVERY_MAX_DIST = 0.5     # Step 5: only apply bonus if distance is already below this
 RESULTS_COUNT = 3            # Final output size
+CROSS_COURSE_OVERFLOW_MARGIN = 0.0   # Cross-course dish overflows if it beats the worst in-course score (0 = just needs to be better)
 
 # Refinement 1: Warm Spice Cluster — keywords that indicate warm aromatic DNA
 # Uses substring matching, so "cinnamon," or "cloves" will both match
@@ -61,6 +62,15 @@ INTEGRATED_CARB_KEYWORDS = [
     "khao", "arroz", "turmeric rice",
 ]
 INTEGRATED_CARB_BOOST = 0.25           # 25% distance reduction for matching integrated-carb dishes
+PROTEIN_MATCH_BOOST = 0.15             # 15% distance reduction when candidate protein matches seed
+
+# Fix 3: Cross-region aromatic relaxation — Mediterranean aromatics (oregano/garlic)
+# differ from Indian aromatics (cumin/cardamom), so lower the gate when crossing
+AROMATIC_RELAXED_CUISINES = {
+    ("indian", "greek"), ("indian", "italian"), ("indian", "mexican"),
+    ("thai", "greek"), ("thai", "italian"), ("thai", "mexican"),
+}
+AROMATIC_GATE_RELAXATION = 0.2         # lower the hard-gate by this amount for cross-region
 
 # Protein group mapping: UI selection → primary_protein values in CSV
 PROTEIN_GROUPS = {
@@ -161,7 +171,12 @@ class HybridEngine:
         target_cuisine: str | None = None,
     ) -> list[dict]:
         """
-        Run the 6-step hybrid pipeline.
+        Run the 6-step hybrid pipeline with Course Overflow.
+
+        First runs within the seed's course (or sibling courses).
+        Then runs a cross-course pass (all categories). If any cross-course
+        dish scores higher than the worst in-course result by at least
+        CROSS_COURSE_OVERFLOW_MARGIN points, it replaces that result.
 
         Parameters
         ----------
@@ -176,7 +191,7 @@ class HybridEngine:
 
         Returns
         -------
-        list[dict]  – Top-5 recommendations with scores and metadata.
+        list[dict]  – Top recommendations with scores and metadata.
         """
         prefs = user_preferences or {}
         dietary = prefs.get("dietary", "").strip().lower()
@@ -192,49 +207,127 @@ class HybridEngine:
         seed_row = self.dishes.iloc[seed_idx]
         seed_cuisine = str(seed_row["cuisine"]).strip()
         seed_category = str(seed_row["category"]).strip()
-        seed_temp = str(seed_row["temp"]).strip().lower()
-        seed_flavor = self.flavor_matrix[seed_idx]
 
-        # ── Step 1: Hard Filtering (Metadata) ───────────────────────────
-        mask = np.ones(len(self.dishes), dtype=bool)
-
-        # Exclude the seed itself
-        mask[seed_idx] = False
-
-        # Dietary constraint
+        # ── Build base mask (dietary + protein + target cuisine) ─────────
+        base_mask = np.ones(len(self.dishes), dtype=bool)
+        base_mask[seed_idx] = False
         if dietary:
-            mask = mask & self._dietary_mask(dietary)
-
-        # Protein constraint
+            base_mask = base_mask & self._dietary_mask(dietary)
         if allowed_proteins != "any" and isinstance(allowed_proteins, list):
-            mask = mask & self._protein_mask(allowed_proteins, dietary)
-
-        # Category constraint
-        if category_filter:
-            mask = mask & (
-                self.dishes["category"].str.lower() == category_filter.lower()
-            )
-        else:
-            # Default: same category as seed, but Appetizer↔Salad are interchangeable
-            SIBLING_CATEGORIES = {"appetizer": {"appetizer", "salad"}, "salad": {"appetizer", "salad"}}
-            allowed_cats = SIBLING_CATEGORIES.get(seed_category.lower(), {seed_category.lower()})
-            mask = mask & (
-                self.dishes["category"].str.lower().isin(allowed_cats)
-            )
-
-        # Target cuisine constraint
+            base_mask = base_mask & self._protein_mask(allowed_proteins, dietary)
         if target_cuisine:
-            mask = mask & (
+            base_mask = base_mask & (
                 self.dishes["cuisine"].str.lower() == target_cuisine.lower()
             )
 
-        eligible_indices = np.where(mask)[0]
-        if len(eligible_indices) == 0:
-            return {"error": "No dishes match the given filters."}
+        # ── Pass 1: Within-course (same category or siblings) ────────────
+        if category_filter:
+            course_mask = base_mask & (
+                self.dishes["category"].str.lower() == category_filter.lower()
+            )
+        else:
+            SIBLING_CATEGORIES = {"appetizer": {"appetizer", "salad"}, "salad": {"appetizer", "salad"}}
+            allowed_cats = SIBLING_CATEGORIES.get(seed_category.lower(), {seed_category.lower()})
+            course_mask = base_mask & (
+                self.dishes["category"].str.lower().isin(allowed_cats)
+            )
+
+        in_course_indices = np.where(course_mask)[0]
+        in_course_results = []
+        in_course_stats = {}
+        if len(in_course_indices) > 0:
+            in_course_results, in_course_stats = self._run_pipeline(
+                seed_idx, in_course_indices, discovery_mode, count=RESULTS_COUNT,
+            )
+
+        # ── Pass 2: Cross-course (all categories) ───────────────────────
+        all_indices = np.where(base_mask)[0]
+        cross_course_results = []
+        cross_course_stats = {}
+        if len(all_indices) > 0:
+            cross_course_results, cross_course_stats = self._run_pipeline(
+                seed_idx, all_indices, discovery_mode, count=RESULTS_COUNT * 2,
+            )
+
+        # ── Course Overflow: merge best of both passes ───────────────────
+        # Start with in-course results; overflow cross-course dishes that
+        # beat the worst in-course score by the margin threshold
+        results = list(in_course_results)
+        in_course_names = {r["dish_name"] for r in results}
+
+        if results:
+            worst_in_course_score = min(r["match_score"] for r in results)
+        else:
+            worst_in_course_score = 0.0  # no in-course results → accept anything
+
+        overflow_added = []
+        for xr in cross_course_results:
+            if xr["dish_name"] in in_course_names:
+                continue  # already included
+            if xr["match_score"] > worst_in_course_score + CROSS_COURSE_OVERFLOW_MARGIN or len(results) < RESULTS_COUNT:
+                xr["cross_course"] = True  # tag for UI
+                xr["match_reason"] = xr["match_reason"] + " · cross-course pick"
+                overflow_added.append(xr)
+
+        # Add overflows, then re-sort by score and trim to RESULTS_COUNT
+        results.extend(overflow_added)
+        results.sort(key=lambda r: r["match_score"], reverse=True)
+        results = results[:RESULTS_COUNT]
+
+        # Re-number ranks
+        for i, r in enumerate(results):
+            r["rank"] = i + 1
+
+        # Merge stats
+        stats = {
+            "total_dishes": len(self.dishes),
+            "in_course_eligible": len(in_course_indices) if len(in_course_indices) > 0 else 0,
+            "cross_course_eligible": len(all_indices),
+            "in_course_results": len(in_course_results),
+            "overflow_added": len(overflow_added),
+            "final_results": len(results),
+        }
+        stats.update({f"in_course_{k}": v for k, v in in_course_stats.items()})
+        stats.update({f"cross_course_{k}": v for k, v in cross_course_stats.items()})
+
+        return {
+            "seed_dish": seed_dish,
+            "seed_cuisine": seed_cuisine,
+            "seed_category": seed_category,
+            "filters_applied": {
+                "dietary": dietary or "any",
+                "category": category_filter or seed_category,
+                "target_cuisine": target_cuisine or "any",
+                "discovery_mode": discovery_mode,
+            },
+            "pipeline_stats": stats,
+            "recommendations": results,
+            "engine": "hybrid",
+        }
+
+    # ──────────────────────────────────────────────────────────────────────
+    #  CORE PIPELINE (Steps 2-6)
+    # ──────────────────────────────────────────────────────────────────────
+
+    def _run_pipeline(
+        self,
+        seed_idx: int,
+        eligible_indices: np.ndarray,
+        discovery_mode: bool,
+        count: int = RESULTS_COUNT,
+    ) -> tuple[list[dict], dict]:
+        """
+        Run Steps 2-6 of the hybrid pipeline on a set of eligible dish indices.
+
+        Returns (results_list, stats_dict).
+        """
+        seed_row = self.dishes.iloc[seed_idx]
+        seed_cuisine = str(seed_row["cuisine"]).strip()
+        seed_temp = str(seed_row["temp"]).strip().lower()
+        seed_flavor = self.flavor_matrix[seed_idx]
 
         # ── Step 2: Semantic Recall (FAISS top-30) ───────────────────────
         seed_embedding = self.embeddings[seed_idx].reshape(1, -1)
-        # Search full index, then intersect with eligible
         k_search = min(len(self.dishes), SEMANTIC_TOP_K * 5)
         scores, idxs = self.index.search(seed_embedding, k_search)
 
@@ -247,7 +340,7 @@ class HybridEngine:
                 break
 
         if not semantic_candidates:
-            return {"error": "No semantically similar dishes found after filtering."}
+            return [], {"semantic_recall": 0, "mouthfeel_guard": 0}
 
         # ── Step 3: Threshold Intersection (Mouthfeel Guard + Bonuses) ────
         seed_context = str(seed_row["context_string"]).lower()
@@ -292,14 +385,21 @@ class HybridEngine:
                     continue
 
             # Aromatic anchor (tightened): if seed aromatic > 0.8,
-            # hard-gate out candidates below 0.5, and penalize "low aroma" (< 0.6)
+            # hard-gate out candidates below threshold, penalize "low aroma"
+            # Cross-region relaxation: lower gates when crossing Indian/Thai → Greek/Italian/Mexican
             aromatic_penalty = False
             if seed_flavor[FLAVOR_DIMS.index("aromatic")] > ANCHOR_THRESHOLD:
                 cand_aroma = cand_flavor[FLAVOR_DIMS.index("aromatic")]
-                if cand_aroma < 0.5:
-                    continue  # hard gate: below 0.5 = too bland, excluded
-                if cand_aroma < 0.6:
-                    aromatic_penalty = True  # soft penalty: 0.5-0.6 = penalized in Step 4
+                cand_cuisine_str = str(cand_row["cuisine"]).strip().lower()
+                aromatic_gate = 0.5
+                aromatic_soft = 0.6
+                if (seed_cuisine.lower(), cand_cuisine_str) in AROMATIC_RELAXED_CUISINES:
+                    aromatic_gate -= AROMATIC_GATE_RELAXATION   # 0.3
+                    aromatic_soft -= AROMATIC_GATE_RELAXATION   # 0.4
+                if cand_aroma < aromatic_gate:
+                    continue  # hard gate: too bland, excluded
+                if cand_aroma < aromatic_soft:
+                    aromatic_penalty = True  # soft penalty: penalized in Step 4
 
             # Temperature guard
             if seed_temp in ("cold", "hot"):
@@ -339,6 +439,15 @@ class HybridEngine:
             if has_penalty:
                 flavor_distances[i] *= 1.20
 
+        # ── Fix 1: Protein Match Boost ──
+        # If candidate's primary_protein matches seed's, reduce flavor distance by 15%
+        seed_protein = str(seed_row.get("primary_protein", "")).strip()
+        if seed_protein:
+            for i, idx in enumerate(candidate_indices):
+                cand_protein = str(self.dishes.iloc[idx].get("primary_protein", "")).strip()
+                if cand_protein and cand_protein == seed_protein:
+                    flavor_distances[i] *= (1.0 - PROTEIN_MATCH_BOOST)
+
         # Convert semantic similarity (0-1, higher=better) to a distance (lower=better)
         # sem_scores are cosine similarity from FAISS, range ~[0, 1]
         semantic_distances = 1.0 - sem_scores
@@ -365,7 +474,7 @@ class HybridEngine:
 
         # ── Sort and build results ───────────────────────────────────────
         order = np.argsort(distances)
-        top_n = order[:RESULTS_COUNT]
+        top_n = order[:count]
 
         results = []
         for rank, pos in enumerate(top_n):
@@ -407,6 +516,7 @@ class HybridEngine:
                 "cuisine_similarity": round(c_sim, 2),
                 "context_string": str(row["context_string"]),
                 "match_reason": match_reason,
+                "cross_course": False,
                 "flavor": {
                     dim: round(float(row[dim]), 2) for dim in FLAVOR_DIMS
                 },
@@ -416,26 +526,11 @@ class HybridEngine:
                 },
             })
 
-        return {
-            "seed_dish": seed_dish,
-            "seed_cuisine": seed_cuisine,
-            "seed_category": seed_category,
-            "filters_applied": {
-                "dietary": dietary or "any",
-                "category": category_filter or seed_category,
-                "target_cuisine": target_cuisine or "any",
-                "discovery_mode": discovery_mode,
-            },
-            "pipeline_stats": {
-                "total_dishes": len(self.dishes),
-                "after_hard_filter": len(eligible_indices),
-                "after_semantic_recall": len(semantic_candidates),
-                "after_mouthfeel_guard": len(guarded),
-                "final_results": len(results),
-            },
-            "recommendations": results,
-            "engine": "hybrid",
+        stats = {
+            "semantic_recall": len(semantic_candidates),
+            "mouthfeel_guard": len(guarded),
         }
+        return results, stats
 
     # ──────────────────────────────────────────────────────────────────────
     #  HELPERS

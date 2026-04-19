@@ -6,7 +6,7 @@
   <title>TasteMate — Discover Foods You'll Love</title>
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet" />
-  <link rel="stylesheet" href="/static/style.css" />
+  <link rel="stylesheet" href="/static/style.css?v=20260418c" />
 </head>
 <body>
 
@@ -101,6 +101,9 @@
           <div class="pref-toggles protein-toggles">
             <label class="toggle-label">
               <input type="checkbox" id="pref-protein-any" onchange="toggleProteinAny()" checked /> <strong>Any / No Preference</strong>
+            </label>
+            <label class="toggle-label">
+              <input type="checkbox" id="pref-protein-veg" onchange="toggleProteinVeg()" /> <strong>Vegetarian (prioritize veg over meat)</strong>
             </label>
             <label class="toggle-label">
               <input type="checkbox" class="protein-check" data-protein="chicken" onchange="updateProteinPref()" /> Chicken
@@ -213,6 +216,6 @@
     </div>
   </div>
 
-  <script src="/static/app.js"></script>
+  <script src="/static/app.js?v=20260418c"></script>
 </body>
 </html>

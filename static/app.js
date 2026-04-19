@@ -17,6 +17,7 @@ const state = {
     likes_sweet: false,
     likes_sour: false,
     allowed_proteins: "any",  // "any" or array like ["chicken","fish"]
+    prefer_vegetarian: false, // soft re-rank: float veg dishes above meat
   },
   results: null,
   engine: "algorithm",  // "algorithm" or "llm"
@@ -201,15 +202,49 @@ function updateTogglePref() {
 
 function toggleProteinAny() {
   const anyCheck = $("#pref-protein-any");
-  document.querySelectorAll(".protein-check").forEach(cb => {
-    cb.checked = false;
-    cb.disabled = anyCheck.checked;
-  });
+  const vegCheck = $("#pref-protein-veg");
+  if (anyCheck.checked) {
+    // "Any" turns off Vegetarian and clears all individual proteins
+    if (vegCheck) vegCheck.checked = false;
+    document.querySelectorAll(".protein-check").forEach(cb => {
+      cb.checked = false;
+      cb.disabled = true;
+    });
+  } else {
+    document.querySelectorAll(".protein-check").forEach(cb => { cb.disabled = false; });
+  }
   state.tastePrefs.allowed_proteins = anyCheck.checked ? "any" : [];
+  state.tastePrefs.prefer_vegetarian = false;
+}
+
+function toggleProteinVeg() {
+  const vegCheck = $("#pref-protein-veg");
+  const anyCheck = $("#pref-protein-any");
+  if (vegCheck.checked) {
+    // Vegetarian preference takes over: clear "Any" and individual meats,
+    // disable individual protein checkboxes (no meat selection makes sense).
+    if (anyCheck) anyCheck.checked = false;
+    document.querySelectorAll(".protein-check").forEach(cb => {
+      cb.checked = false;
+      cb.disabled = true;
+    });
+    state.tastePrefs.allowed_proteins = "any";  // no hard meat filter
+    state.tastePrefs.prefer_vegetarian = true;  // soft re-rank flag
+  } else {
+    // Falling back to "Any" by default
+    if (anyCheck) anyCheck.checked = true;
+    document.querySelectorAll(".protein-check").forEach(cb => { cb.disabled = true; });
+    state.tastePrefs.allowed_proteins = "any";
+    state.tastePrefs.prefer_vegetarian = false;
+  }
 }
 
 function updateProteinPref() {
   const anyCheck = $("#pref-protein-any");
+  const vegCheck = $("#pref-protein-veg");
+  // Selecting an individual protein turns Vegetarian off
+  if (vegCheck && vegCheck.checked) vegCheck.checked = false;
+  state.tastePrefs.prefer_vegetarian = false;
   const checked = Array.from(document.querySelectorAll(".protein-check:checked")).map(cb => cb.dataset.protein);
   if (checked.length === 0) {
     anyCheck.checked = true;
@@ -269,11 +304,10 @@ async function getRecommendations() {
   const headers = { "Content-Type": "application/json" };
 
   const engines = [
-    { key: "hybrid", label: "🔬 Hybrid Engine", endpoint: "/api/recommend-hybrid" },
+    { key: "hybrid-v3", label: "🧬 Hybrid 3.0", endpoint: "/api/recommend-hybrid-v3" },
+    { key: "hybrid-v2", label: "🌟 Hybrid 2.0", endpoint: "/api/recommend-hybrid-v2" },
+    { key: "hybrid", label: "🔬 Hybrid 1.0", endpoint: "/api/recommend-hybrid" },
     { key: "algorithm", label: "⚙️ Algorithm", endpoint: "/api/recommend" },
-    { key: "llm", label: "🤖 Llama 3.3 70B", endpoint: "/api/recommend-llm" },
-    { key: "gemini", label: "✨ Gemini 2.5 Flash", endpoint: "/api/recommend-gemini" },
-    { key: "xai", label: "🚀 Grok (x.AI)", endpoint: "/api/recommend-xai" },
   ];
 
   // Initialize results array and build initial UI with loading placeholders
@@ -340,8 +374,8 @@ function renderResults(data) {
   html += `</div></div>`;
 
   // ── Engine badge ──
-  const engineLabel = data.engine === "hybrid" ? "🔬 Hybrid Engine" : data.engine === "gemini" ? "✨ Gemini 2.5 Flash" : data.engine === "llm" ? "🤖 Llama 3.3 70B via Groq" : "⚙️ Algorithm";
-  const engineClass = data.engine === "hybrid" ? "hybrid" : data.engine === "gemini" ? "gemini" : data.engine === "llm" ? "llm" : "algo";
+  const engineLabel = data.engine === "hybrid-v3" ? "🧬 Hybrid 3.0" : data.engine === "hybrid-v2" ? "🌟 Hybrid 2.0" : data.engine === "hybrid" ? "🔬 Hybrid 1.0" : "⚙️ Algorithm";
+  const engineClass = data.engine === "hybrid-v3" ? "hybrid-v3" : data.engine === "hybrid-v2" ? "hybrid-v2" : data.engine === "hybrid" ? "hybrid" : "algo";
   html += `<div class="engine-badge-row">
     <span class="engine-badge ${engineClass}">${engineLabel} recommendations</span>
   </div>`;
@@ -488,8 +522,8 @@ function renderComparisonResults(engineResults) {
 }
 
 function renderCompactCard(dish, i, engineKey) {
-  const borderColors = { algorithm: "#3b82f6", llm: "#8b5cf6", gemini: "#2563eb", hybrid: "#16a34a", xai: "#e11d48" };
-  const engineLabels = { algorithm: "Algorithm", llm: "Llama 3.3 70B", gemini: "Gemini 2.5 Flash", hybrid: "Hybrid Engine", xai: "Grok (x.AI)" };
+  const borderColors = { algorithm: "#3b82f6", hybrid: "#16a34a", "hybrid-v2": "#f59e0b", "hybrid-v3": "#9333ea" };
+  const engineLabels = { algorithm: "Algorithm", hybrid: "Hybrid 1.0", "hybrid-v2": "Hybrid 2.0", "hybrid-v3": "Hybrid 3.0" };
   const border = borderColors[engineKey] || "#ccc";
   const dishData = JSON.stringify({...dish, _engine: engineKey, _engineLabel: engineLabels[engineKey] || engineKey}).replace(/'/g, "&#39;");
   return `<div class="compact-card" style="border-left:3px solid ${border}" onclick='showCompactDetail(${dishData})'>
@@ -514,7 +548,7 @@ function renderCompactCard(dish, i, engineKey) {
 }
 
 function showCompactDetail(dish) {
-  const borderColors = { algorithm: "#3b82f6", llm: "#8b5cf6", gemini: "#2563eb", hybrid: "#16a34a", xai: "#e11d48" };
+  const borderColors = { algorithm: "#3b82f6", hybrid: "#16a34a", "hybrid-v2": "#f59e0b", "hybrid-v3": "#9333ea" };
   const border = borderColors[dish._engine] || "#ccc";
   let html = `<div style="border-left:4px solid ${border};padding-left:1rem">`;
   html += `<h2 style="margin:0 0 0.25rem">${dish.dish_name}</h2>`;
@@ -815,7 +849,7 @@ function startOver() {
   state.favoriteDishes = [];
   state.targetCuisines = [];
   state.results = null;
-  state.tastePrefs = { dietary: "any", spice_level: "medium", likes_creamy: false, likes_aromatic: false, likes_sweet: false, likes_sour: false };
+  state.tastePrefs = { dietary: "any", spice_level: "medium", likes_creamy: false, likes_aromatic: false, likes_sweet: false, likes_sour: false, allowed_proteins: "any", prefer_vegetarian: false };
   $("#btn-step1-next").disabled = true;
   $$("#source-cuisine-grid .cuisine-card").forEach((el) => el.classList.remove("selected"));
   $$(".pref-btn").forEach((b) => b.classList.remove("selected"));
