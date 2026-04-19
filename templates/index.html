@@ -6,7 +6,7 @@
   <title>TasteMate — Discover Foods You'll Love</title>
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet" />
-  <link rel="stylesheet" href="/static/style.css?v=20260418c" />
+  <link rel="stylesheet" href="/static/style.css?v=20260419a" />
 </head>
 <body>
 
@@ -26,17 +26,19 @@
     </div>
   </div>
 
-  <!-- Progress Bar — now 5 steps -->
+  <!-- Progress Bar — 6 steps -->
   <div class="progress-bar">
     <div class="progress-step active"><div class="dot">1</div><span>Cuisine</span></div>
     <div class="progress-line"></div>
-    <div class="progress-step"><div class="dot">2</div><span>Favorites</span></div>
+    <div class="progress-step"><div class="dot">2</div><span>Diet</span></div>
     <div class="progress-line"></div>
-    <div class="progress-step"><div class="dot">3</div><span>Taste</span></div>
+    <div class="progress-step"><div class="dot">3</div><span>Favorites</span></div>
     <div class="progress-line"></div>
-    <div class="progress-step"><div class="dot">4</div><span>Explore</span></div>
+    <div class="progress-step"><div class="dot">4</div><span>Taste</span></div>
     <div class="progress-line"></div>
-    <div class="progress-step"><div class="dot">5</div><span>Results</span></div>
+    <div class="progress-step"><div class="dot">5</div><span>Explore</span></div>
+    <div class="progress-line"></div>
+    <div class="progress-step"><div class="dot">6</div><span>Results</span></div>
   </div>
 
   <div class="container">
@@ -51,38 +53,80 @@
       </div>
     </section>
 
-    <!-- ═══ Step 2: Pick Favorite Dishes ═══ -->
+    <!-- ═══ Step 2: Diet & Proteins (HARD CONSTRAINTS) ═══ -->
     <section id="step-2" class="step">
-      <h2 class="step-title">Pick your favorites</h2>
-      <p class="step-subtitle">Select at least 3 dishes you absolutely love. The more you pick, the better.</p>
-      <input type="text" id="dish-search" class="search-box" placeholder="Search dishes..." oninput="filterDishes()" />
-      <div id="dish-selection-info" class="selection-info">Click on dishes you love (select at least 1)</div>
-      <div id="dish-grid" class="dish-grid"></div>
+      <h2 class="step-title">What do you eat?</h2>
+      <p class="step-subtitle">We'll filter out anything you don't want to see — so your favorites list stays clean and relevant.</p>
+
+      <div class="prefs-grid">
+        <!-- Unified Dietary + Protein -->
+        <div class="pref-card">
+          <h3>What do you eat?</h3>
+          <p class="pref-desc">Pick the option that best describes you. If you eat meat, you can narrow down to specific proteins below.</p>
+          <div class="pref-options" data-pref="dietary">
+            <button class="pref-btn selected" data-val="any" onclick="selectDiet('any',this)">Any / No Preference</button>
+            <button class="pref-btn" data-val="veg" onclick="selectDiet('veg',this)">Vegetarian</button>
+            <button class="pref-btn" data-val="vegan" onclick="selectDiet('vegan',this)">Vegan</button>
+            <button class="pref-btn" data-val="pescatarian" onclick="selectDiet('pescatarian',this)">Pescatarian (Fish only)</button>
+            <button class="pref-btn" data-val="non-veg" onclick="selectDiet('non-veg',this)">Non-Veg (I eat meat)</button>
+          </div>
+
+          <!-- Protein sub-selection — only visible when Non-Veg is picked -->
+          <div id="protein-subpanel" class="protein-subpanel" style="display:none">
+            <p class="pref-desc" style="margin-top:1rem"><strong>Which meats do you eat?</strong> Leave all checked if you eat everything.</p>
+            <div class="pref-toggles protein-toggles">
+              <label class="toggle-label">
+                <input type="checkbox" class="protein-check" data-protein="chicken" onchange="updateProteinPref()" checked /> Chicken
+              </label>
+              <label class="toggle-label">
+                <input type="checkbox" class="protein-check" data-protein="fish" onchange="updateProteinPref()" checked /> Fish & Seafood
+              </label>
+              <label class="toggle-label">
+                <input type="checkbox" class="protein-check" data-protein="lamb" onchange="updateProteinPref()" checked /> Lamb / Goat
+              </label>
+              <label class="toggle-label">
+                <input type="checkbox" class="protein-check" data-protein="beef" onchange="updateProteinPref()" checked /> Beef / Veal
+              </label>
+              <label class="toggle-label">
+                <input type="checkbox" class="protein-check" data-protein="pork" onchange="updateProteinPref()" checked /> Pork
+              </label>
+              <label class="toggle-label">
+                <input type="checkbox" class="protein-check" data-protein="duck" onchange="updateProteinPref()" checked /> Duck / Quail / Rabbit
+              </label>
+              <label class="toggle-label">
+                <input type="checkbox" class="protein-check" data-protein="egg" onchange="updateProteinPref()" checked /> Egg
+              </label>
+            </div>
+          </div>
+        </div>
+      </div>
+
       <div class="btn-row">
         <button class="btn btn-secondary" onclick="goToStep(1)">&larr; Back</button>
-        <button id="btn-step2-next" class="btn btn-primary" disabled onclick="nextStep2()">Next &rarr;</button>
+        <button class="btn btn-primary" onclick="nextStep2()">Next &rarr;</button>
       </div>
     </section>
 
-    <!-- ═══ Step 3: Taste Preferences ═══ -->
+    <!-- ═══ Step 3: Pick Favorite Dishes (filtered by Tier 1) ═══ -->
     <section id="step-3" class="step">
-      <h2 class="step-title">Tell us about your taste</h2>
-      <p class="step-subtitle">These preferences help us fine-tune your recommendations.</p>
+      <h2 class="step-title">Pick your favorites</h2>
+      <p class="step-subtitle">Select at least 3 dishes you absolutely love. The more you pick, the better.</p>
+      <input type="text" id="dish-search" class="search-box" placeholder="Search dishes..." oninput="filterDishes()" />
+      <div id="dish-course-counts" class="course-counts"></div>
+      <div id="dish-selection-info" class="selection-info">Click on dishes you love (select at least 3)</div>
+      <div id="dish-grid" class="dish-grid"></div>
+      <div class="btn-row">
+        <button class="btn btn-secondary" onclick="goToStep(2)">&larr; Back</button>
+        <button id="btn-step3-next" class="btn btn-primary" disabled onclick="nextStep3()">Next &rarr;</button>
+      </div>
+    </section>
+
+    <!-- ═══ Step 4: Taste Preferences (SOFT BIASES) ═══ -->
+    <section id="step-4" class="step">
+      <h2 class="step-title">How do you like your food?</h2>
+      <p class="step-subtitle">These soft preferences bias the ranking — they don't filter anything out.</p>
 
       <div class="prefs-grid">
-        <!-- Dietary -->
-        <div class="pref-card">
-          <h3>Diet Preference</h3>
-          <p class="pref-desc">What do you usually eat?</p>
-          <div class="pref-options" data-pref="dietary">
-            <button class="pref-btn selected" data-val="any" onclick="selectPref('dietary','any',this)">Any / No Preference</button>
-            <button class="pref-btn" data-val="non-veg" onclick="selectPref('dietary','non-veg',this)">Non-Veg (Chicken, Meat, Fish)</button>
-            <button class="pref-btn" data-val="veg" onclick="selectPref('dietary','veg',this)">Vegetarian</button>
-            <button class="pref-btn" data-val="vegan" onclick="selectPref('dietary','vegan',this)">Vegan</button>
-            <button class="pref-btn" data-val="pescatarian" onclick="selectPref('dietary','pescatarian',this)">Pescatarian (Fish OK)</button>
-          </div>
-        </div>
-
         <!-- Spice Level -->
         <div class="pref-card">
           <h3>Spice Tolerance</h3>
@@ -91,41 +135,6 @@
             <button class="pref-btn" data-val="mild" onclick="selectPref('spice_level','mild',this)">Mild — Keep it gentle</button>
             <button class="pref-btn selected" data-val="medium" onclick="selectPref('spice_level','medium',this)">Medium — Some kick</button>
             <button class="pref-btn" data-val="hot" onclick="selectPref('spice_level','hot',this)">Hot — Bring the fire!</button>
-          </div>
-        </div>
-
-        <!-- Protein / Meat Preferences -->
-        <div class="pref-card">
-          <h3>Protein Preferences</h3>
-          <p class="pref-desc">Select the proteins you eat. Unselected proteins will be excluded from recommendations.</p>
-          <div class="pref-toggles protein-toggles">
-            <label class="toggle-label">
-              <input type="checkbox" id="pref-protein-any" onchange="toggleProteinAny()" checked /> <strong>Any / No Preference</strong>
-            </label>
-            <label class="toggle-label">
-              <input type="checkbox" id="pref-protein-veg" onchange="toggleProteinVeg()" /> <strong>Vegetarian (prioritize veg over meat)</strong>
-            </label>
-            <label class="toggle-label">
-              <input type="checkbox" class="protein-check" data-protein="chicken" onchange="updateProteinPref()" /> Chicken
-            </label>
-            <label class="toggle-label">
-              <input type="checkbox" class="protein-check" data-protein="fish" onchange="updateProteinPref()" /> Fish & Seafood
-            </label>
-            <label class="toggle-label">
-              <input type="checkbox" class="protein-check" data-protein="lamb" onchange="updateProteinPref()" /> Lamb / Goat
-            </label>
-            <label class="toggle-label">
-              <input type="checkbox" class="protein-check" data-protein="beef" onchange="updateProteinPref()" /> Beef / Veal
-            </label>
-            <label class="toggle-label">
-              <input type="checkbox" class="protein-check" data-protein="pork" onchange="updateProteinPref()" /> Pork
-            </label>
-            <label class="toggle-label">
-              <input type="checkbox" class="protein-check" data-protein="duck" onchange="updateProteinPref()" /> Duck / Quail / Rabbit
-            </label>
-            <label class="toggle-label">
-              <input type="checkbox" class="protein-check" data-protein="egg" onchange="updateProteinPref()" /> Egg
-            </label>
           </div>
         </div>
 
@@ -151,31 +160,31 @@
       </div>
 
       <div class="btn-row">
-        <button class="btn btn-secondary" onclick="goToStep(2)">&larr; Back</button>
-        <button class="btn btn-primary" onclick="nextStep3()">Next &rarr;</button>
+        <button class="btn btn-secondary" onclick="goToStep(3)">&larr; Back</button>
+        <button class="btn btn-primary" onclick="nextStep4()">Next &rarr;</button>
       </div>
     </section>
 
-    <!-- ═══ Step 4: Select Target Cuisines ═══ -->
-    <section id="step-4" class="step">
+    <!-- ═══ Step 5: Select Target Cuisines ═══ -->
+    <section id="step-5" class="step">
       <h2 class="step-title">Which cuisines to explore?</h2>
       <p class="step-subtitle">Select up to 5 cuisines you'd like recommendations for.</p>
       <div id="target-selection-info" class="selection-info">Select 1 to 5 cuisines to explore</div>
       <div id="target-cuisine-grid" class="cuisine-grid"></div>
 
       <div class="btn-row">
-        <button class="btn btn-secondary" onclick="goToStep(3)">&larr; Back</button>
+        <button class="btn btn-secondary" onclick="goToStep(4)">&larr; Back</button>
         <button id="btn-recommend" class="btn btn-primary" disabled onclick="getRecommendations()">Get Recommendations</button>
       </div>
     </section>
 
-    <!-- ═══ Step 5: Results ═══ -->
-    <section id="step-5" class="step">
+    <!-- ═══ Step 6: Results ═══ -->
+    <section id="step-6" class="step">
       <h2 class="step-title">Your Personalized Picks</h2>
       <p class="step-subtitle">Compare recommendations from all engines side by side.</p>
       <div id="results-container"></div>
       <div class="btn-row">
-        <button class="btn btn-secondary" onclick="goToStep(4)">&larr; Change Cuisines</button>
+        <button class="btn btn-secondary" onclick="goToStep(5)">&larr; Change Cuisines</button>
         <button class="btn btn-primary" onclick="startOver()">Start Over</button>
       </div>
     </section>
@@ -216,6 +225,6 @@
     </div>
   </div>
 
-  <script src="/static/app.js?v=20260418c"></script>
+  <script src="/static/app.js?v=20260419a"></script>
 </body>
 </html>

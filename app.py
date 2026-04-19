@@ -818,6 +818,124 @@ def get_cuisines():
 
 HYBRID_COURSE_ORDER = ["Appetizer", "Soup", "Salad", "Main Course", "Dessert", "Drink"]
 
+# ── Canonical course-label mapping ─────────────────────────────────────────────
+# The source data has inconsistent casing/aliases ("Main", "Mains", "Main Course";
+# "Appetizer" vs "Appetizers"). Every endpoint that surfaces a course name to the
+# UI must run it through canonical_category() so the same course never splits
+# into multiple buckets downstream.
+_COURSE_CANONICAL = {
+    "main":         "Main Course",
+    "main course":  "Main Course",
+    "mains":        "Main Course",
+    "appetizer":    "Appetizer",
+    "appetizers":   "Appetizer",
+    "soup":         "Soup",
+    "soups":        "Soup",
+    "salad":        "Salad",
+    "salads":       "Salad",
+    "dessert":      "Dessert",
+    "desserts":     "Dessert",
+    "drink":        "Drink",
+    "drinks":       "Drink",
+}
+
+def canonical_category(c):
+    """Map raw category string to the canonical display label."""
+    raw = str(c or "").strip()
+    if not raw:
+        return "Main Course"
+    return _COURSE_CANONICAL.get(raw.lower(), raw)
+
+
+# ── Visible / hidden selection with Option-C allocation + multi-fav attribution ──
+# Each engine collects up to `cap_per_seed` candidates per seed dish. This helper
+# then deduplicates across seeds, attaches the full list of seeds that ranked each
+# candidate (so UI can say "Because you liked X and Y"), and partitions the pool
+# into a "visible" slice (shown by default) and a "hidden" slice (revealed via
+# "Show more"). Visible selection uses Option C:
+#   - If #seeds-in-course ≤ max_visible: guarantee ≥1 slot per seed, fill rest
+#     by top score.
+#   - Otherwise: just take global top-`max_visible` by score.
+# Hidden pool is score-descending, capped at `max_hidden`.
+def select_with_show_more(per_seed_picks, max_visible=3, max_hidden=6, score_floor=0.0):
+    """
+    per_seed_picks: dict[seed_name] -> list of (score, matched_list, cand) tuples.
+                    Each seed's list should already be sorted desc and capped at 3.
+    Returns: (visible_entries, hidden_entries)
+    Each entry is:
+        {
+          "cand": <original candidate row/dict>,
+          "top_score": float,
+          "matched_favorites": [{"name": seed, "score": float, "matched": [facet,...]}, ...]
+                               (sorted by score desc)
+        }
+    """
+    # Dedup by dish_name; collect every seed that ranked this candidate.
+    # We keep the first `cand` we see (they're equivalent rows across seeds).
+    by_dish = {}
+    for seed, picks in per_seed_picks.items():
+        for s, matched, cand in picks:
+            if s < score_floor:
+                continue
+            # Support both pandas Series and plain dicts for `cand`.
+            try:
+                name = cand["dish_name"]
+            except Exception:
+                name = cand.get("dish_name") if isinstance(cand, dict) else None
+            if not name:
+                continue
+            entry = by_dish.get(name)
+            if entry is None:
+                entry = {"cand": cand, "matched_favorites": []}
+                by_dish[name] = entry
+            entry["matched_favorites"].append({
+                "name": seed, "score": float(s), "matched": list(matched or []),
+            })
+
+    # Sort each entry's seed list by score desc; stamp top_score.
+    for entry in by_dish.values():
+        entry["matched_favorites"].sort(key=lambda x: -x["score"])
+        entry["top_score"] = entry["matched_favorites"][0]["score"]
+
+    # Global score-descending order (used both as a tiebreaker and as hidden order).
+    all_sorted = sorted(by_dish.values(), key=lambda e: -e["top_score"])
+
+    # Seeds that actually contributed at least one candidate in this course.
+    seeds_in_course = [s for s, picks in per_seed_picks.items() if picks]
+    n_seeds = len(seeds_in_course)
+
+    visible = []
+    used = set()  # identity-keyed (id(entry))
+
+    if 0 < n_seeds <= max_visible:
+        # Option C: reserve one slot per contributing seed by taking that seed's
+        # top non-used candidate. Iterate seeds in their favourites-order so the
+        # reservation is deterministic and matches the order the user picked them.
+        for seed in seeds_in_course:
+            for entry in all_sorted:
+                if id(entry) in used:
+                    continue
+                if any(mf["name"] == seed for mf in entry["matched_favorites"]):
+                    visible.append(entry)
+                    used.add(id(entry))
+                    break
+            if len(visible) >= max_visible:
+                break
+
+    # Fill any remaining visible slots with the next-highest scoring entries.
+    for entry in all_sorted:
+        if len(visible) >= max_visible:
+            break
+        if id(entry) in used:
+            continue
+        visible.append(entry)
+        used.add(id(entry))
+
+    # Hidden pool: everything else, ordered by score, capped.
+    hidden = [e for e in all_sorted if id(e) not in used][:max_hidden]
+
+    return visible, hidden
+
 @app.route("/api/dishes")
 @login_required
 def get_dishes():
@@ -832,7 +950,7 @@ def get_dishes():
 
         grouped = {}
         for _, row in cdf.iterrows():
-            cat = str(row["category"])
+            cat = canonical_category(row["category"])
             if cat not in grouped:
                 grouped[cat] = []
             grouped[cat].append({
@@ -1095,9 +1213,10 @@ def recommend():
             }
             scoring_log.append(breakdown)
 
+            _mf_score = round(final * 100, 1)
             all_scores.append({
                 "dish_name": row["dish_name"],
-                "score": round(final * 100, 1),
+                "score": _mf_score,
                 "cosine": round(cs * 100, 1),
                 "euclidean": round(es * 100, 1),
                 "ingredient_score": round(ing_score * 100, 1),
@@ -1111,6 +1230,7 @@ def recommend():
                 "ingredients": str(row.get("ingredients", "")),
                 "matched_favorite": matched_fav,
                 "matched_favorite_score": matched_fav_score,
+                "matched_favorites": [{"name": matched_fav, "score": matched_fav_score, "facets": []}] if matched_fav else [],
                 "why": explanation,
                 "scoring": {
                     "cosine_sim": round(cs * 100, 1),
@@ -1164,6 +1284,7 @@ def recommend():
             "cuisine_similarity": round(c_sim, 2),
             "total_dishes_evaluated": len(all_scores),
             "courses": courses_result,
+            "visible_per_course": 3,
         }
         all_scoring_details[tc_title] = scoring_log[:30]
 
@@ -2122,8 +2243,15 @@ def recommend_hybrid():
         favorites_with_courses.append({"name": fav, "course": course})
 
     def _collect_for_cuisine(tc, dietary_arg):
-        """Run the hybrid pipeline for one target cuisine and return courses_dict + counters."""
-        courses_dict_local = {}
+        """Run the hybrid pipeline for one target cuisine and return courses_dict + counters.
+
+        Uses the shared select_with_show_more helper so a single candidate matched by
+        multiple favorites is rendered once with all seed attributions (matched_favorites
+        array). The first `visible_per_course` entries per course are the defaults;
+        the remainder are revealed by a frontend "Show more" toggle.
+        """
+        # per_seed_by_course[cat][seed_name] = [(score, matched_list, rec_dict), ...]
+        per_seed_by_course = {}
         total_eval = 0
         for fav in favorite_dishes:
             result = hybrid_engine.get_recommendations(
@@ -2132,45 +2260,68 @@ def recommend_hybrid():
             )
             if isinstance(result, dict) and "recommendations" in result:
                 total_eval += result.get("pipeline_stats", {}).get("after_hard_filter", 0)
-                for rec in result["recommendations"]:
-                    cat = rec.get("category", "Main Course")
-                    dish_entry = {
-                        "dish_name": rec["dish_name"],
-                        "score": rec["match_score"],
-                        "category": cat,
-                        "dietary": rec.get("dietary_type", ""),
-                        "protein": rec.get("primary_protein", ""),
-                        "description": rec.get("context_string", ""),
-                        "why": rec.get("match_reason", f"Flavor distance: {rec['flavor_distance']:.3f}"),
-                        "matched_favorite": fav,
-                        "matched_favorite_score": rec["match_score"],
-                        "course": cat,
-                        "spice_level": "",
-                        "ingredients": "",
-                        "flavor_distance": rec["flavor_distance"],
-                        "flavor": rec.get("flavor", {}),
-                        "seed_flavor": rec.get("seed_flavor", {}),
-                        "scoring": {
-                            "cosine_sim": rec["match_score"],
-                            "cooking_method": 0,
-                            "ingredient_match": 0,
-                            "temperature_match": 100 if rec.get("temp") else 0,
-                            "ingredient_category": 0,
-                            "dietary_compat": 100,
-                        },
-                    }
-                    if cat not in courses_dict_local:
-                        courses_dict_local[cat] = []
-                    courses_dict_local[cat].append(dish_entry)
-        # Dedupe + sort within each course
-        for cat in courses_dict_local:
-            seen = set()
-            unique = []
-            for d in sorted(courses_dict_local[cat], key=lambda x: x["score"], reverse=True):
-                if d["dish_name"] not in seen:
-                    seen.add(d["dish_name"])
-                    unique.append(d)
-            courses_dict_local[cat] = unique
+                for rec in result["recommendations"][:3]:  # ≤3 per seed per course
+                    cat = canonical_category(rec.get("category", "Main Course"))
+                    # Treat rec as the candidate dict; keep dish_name accessible.
+                    rec_cand = dict(rec)
+                    rec_cand["dish_name"] = rec["dish_name"]
+                    score = float(rec.get("match_score", 0.0))
+                    matched = [rec.get("match_reason")] if rec.get("match_reason") else []
+                    per_seed_by_course.setdefault(cat, {}).setdefault(fav, []).append((score, matched, rec_cand))
+
+        def _build_h1_entry(entry, cat):
+            cand = entry["cand"]
+            mfs = entry["matched_favorites"]
+            top = mfs[0]
+            display_score = float(top["score"])
+            why_text = (
+                top["matched"][0] if top["matched"]
+                else f"Flavor distance: {cand.get('flavor_distance', 0):.3f}"
+            )
+            matched_favorites_display = [
+                {
+                    "name":   mf["name"],
+                    "score":  float(mf["score"]),
+                    "facets": mf["matched"][:5],
+                }
+                for mf in mfs
+            ]
+            return {
+                "dish_name":              str(cand["dish_name"]),
+                "score":                  display_score,
+                "category":               cat,
+                "dietary":                cand.get("dietary_type", ""),
+                "protein":                cand.get("primary_protein", ""),
+                "description":            cand.get("context_string", ""),
+                "why":                    why_text,
+                "matched_favorite":       top["name"],
+                "matched_favorite_score": display_score,
+                "matched_favorites":      matched_favorites_display,
+                "course":                 cat,
+                "spice_level":            "",
+                "ingredients":            "",
+                "flavor_distance":        cand.get("flavor_distance", 0),
+                "flavor":                 cand.get("flavor", {}),
+                "seed_flavor":            cand.get("seed_flavor", {}),
+                "scoring": {
+                    "cosine_sim":          display_score,
+                    "cooking_method":      0,
+                    "ingredient_match":    0,
+                    "temperature_match":   100 if cand.get("temp") else 0,
+                    "ingredient_category": 0,
+                    "dietary_compat":      100,
+                },
+            }
+
+        courses_dict_local = {}
+        for cat, per_seed in per_seed_by_course.items():
+            visible_entries, hidden_entries = select_with_show_more(
+                per_seed, max_visible=3, max_hidden=6, score_floor=0.0,
+            )
+            entries = [_build_h1_entry(e, cat) for e in visible_entries]
+            entries += [_build_h1_entry(e, cat) for e in hidden_entries]
+            if entries:
+                courses_dict_local[cat] = entries
         return courses_dict_local, total_eval
 
     # Run hybrid pipeline: top 3 per favorite, per target cuisine
@@ -2195,6 +2346,7 @@ def recommend_hybrid():
             "cuisine_similarity": c_sim,
             "total_dishes_evaluated": total_evaluated,
             "courses": courses_dict,
+            "visible_per_course": 3,
         }
 
     return jsonify({
@@ -2363,6 +2515,8 @@ def recommend_hybrid_v2():
 
         courses_dict = {}
         total_evaluated = 0
+        # per_seed_by_course[cat][fav] = [(score, matched_list, cand_dict), ...]
+        per_seed_by_course = {}
 
         for fav in favorite_dishes:
             # Pull all 10 Grok recommendations for this favorite → target
@@ -2479,27 +2633,50 @@ def recommend_hybrid_v2():
             else:
                 pool = candidates
 
-            # Pool is in priority order. Take top 3.
+            # Pool is in priority order. Cap at ≤3 per seed, feed into
+            # per_seed_by_course for downstream Option-C selection + dedup.
             for dish_entry in pool[:3]:
-                cat = dish_entry["course"]
-                if cat not in courses_dict:
-                    courses_dict[cat] = []
-                courses_dict[cat].append(dish_entry)
+                cat = canonical_category(dish_entry["course"])
+                dish_entry["category"] = cat
+                dish_entry["course"]   = cat
+                score = float(dish_entry.get("score", 0.0))
+                matched = [dish_entry.get("why")] if dish_entry.get("why") else []
+                per_seed_by_course.setdefault(cat, {}).setdefault(fav, []).append((score, matched, dish_entry))
 
-        # Dedupe and sort within each course by score
-        for cat in courses_dict:
-            seen = set()
-            unique = []
-            for d in sorted(courses_dict[cat], key=lambda x: -x["score"]):
-                if d["dish_name"] not in seen:
-                    seen.add(d["dish_name"])
-                    unique.append(d)
-            courses_dict[cat] = unique
+        def _build_h2_entry(entry, cat):
+            cand = entry["cand"]
+            mfs = entry["matched_favorites"]
+            top = mfs[0]
+            display_score = float(top["score"])
+            matched_favorites_display = [
+                {"name": mf["name"], "score": float(mf["score"]), "facets": mf["matched"][:5]}
+                for mf in mfs
+            ]
+            # Start from the original cand (already has all Hybrid 2.0 fields),
+            # then overlay updated attribution + score.
+            out = dict(cand)
+            out["score"] = display_score
+            out["category"] = cat
+            out["course"] = cat
+            out["matched_favorite"] = top["name"]
+            out["matched_favorite_score"] = display_score
+            out["matched_favorites"] = matched_favorites_display
+            return out
+
+        for cat, per_seed in per_seed_by_course.items():
+            visible_entries, hidden_entries = select_with_show_more(
+                per_seed, max_visible=3, max_hidden=6, score_floor=0.0,
+            )
+            entries = [_build_h2_entry(e, cat) for e in visible_entries]
+            entries += [_build_h2_entry(e, cat) for e in hidden_entries]
+            if entries:
+                courses_dict[cat] = entries
 
         all_recommendations[tc] = {
             "cuisine_similarity": c_sim,
             "total_dishes_evaluated": total_evaluated,
             "courses": courses_dict,
+            "visible_per_course": 3,
         }
 
     return jsonify({
@@ -2845,6 +3022,13 @@ def recommend_hybrid_v3():
                 return "main course"
             return c
 
+        # Delegate to the module-level canonicalizer so every endpoint agrees
+        # on display labels (see canonical_category above).
+        _display_cat = canonical_category
+
+        # ── Phase 1: collect top-3 per seed, grouped by category ──
+        # per_seed_by_course[cat][seed_name] = [(score, matched, cand_dict), ...]
+        per_seed_by_course = {}
         for fav in favorite_dishes:
             seed_rows = fdf[fdf["dish_name"] == fav]
             if seed_rows.empty:
@@ -2860,64 +3044,85 @@ def recommend_hybrid_v3():
             for _, cand in pool.iterrows():
                 if cand["dish_name"] == fav and str(cand["cuisine"]).lower() == source_cuisine.lower():
                     continue  # skip self
-                # Category gate — only pair like-with-like courses.
-                # If seed has no category label, fall through (no gate).
                 if seed_cat and _norm_cat(cand.get("category")) != seed_cat:
                     continue
                 s, matched = _facet_overlap_score(seed, cand, "veg" if prefer_veg else dietary)
                 if s <= 0:
                     continue
-                scored.append((s, matched, cand))
+                scored.append((s, matched, cand.to_dict()))
 
             scored.sort(key=lambda x: x[0], reverse=True)
 
+            # Enforce "≤3 per favorite per course" — your explicit constraint.
             for s, matched, cand in scored[:3]:
-                cat = str(cand.get("category", "") or "Main Course").strip() or "Main Course"
-                # Score scaling: facet score → 0-100 display.
-                # Typical strong matches land around 15-25; cap at 100.
-                display_score = min(100, round(s * 4, 1))
-                why_text = " · ".join(matched[:5]) if matched else f"Facet overlap score: {s:.1f}"
-                dish_entry = {
-                    "dish_name":        str(cand["dish_name"]),
-                    "score":            display_score,
-                    "category":         cat,
-                    "dietary":          str(cand.get("dietary_type", "")),
-                    "protein":          str(cand.get("primary_protein", "") or ""),
-                    "description":      "",
-                    "why":              why_text,
-                    "matched_favorite": fav,
-                    "matched_favorite_score": display_score,
-                    "course":           cat,
-                    "spice_level":      "",
-                    "ingredients":      "",
-                    "facet_overlap":    round(s, 2),
-                    "facet_matches":    matched,
-                    "scoring": {
-                        "cosine_sim":          display_score,
-                        "cooking_method":      0,
-                        "ingredient_match":    0,
-                        "temperature_match":   0,
-                        "ingredient_category": 0,
-                        "dietary_compat":      100,
-                    },
-                }
-                if cat not in courses_dict:
-                    courses_dict[cat] = []
-                courses_dict[cat].append(dish_entry)
+                cat = _display_cat(cand.get("category"))
+                per_seed_by_course.setdefault(cat, {}).setdefault(fav, []).append((s, matched, cand))
 
-        # Dedupe within each course, keep highest-score occurrence
-        for cat in courses_dict:
-            seen = {}
-            for d in courses_dict[cat]:
-                name = d["dish_name"]
-                if name not in seen or d["score"] > seen[name]["score"]:
-                    seen[name] = d
-            courses_dict[cat] = sorted(seen.values(), key=lambda x: -x["score"])
+        # ── Phase 2: dedup + Option-C visible slice + hidden pool ──
+        def _build_dish_entry(entry, cat):
+            cand = entry["cand"]
+            mfs = entry["matched_favorites"]
+            top = mfs[0]
+            # Score scaling: facet score → 0-100 display. Typical strong matches
+            # land around 15-25; cap at 100.
+            display_score = min(100, round(top["score"] * 4, 1))
+            why_text = (
+                " · ".join(top["matched"][:5]) if top["matched"]
+                else f"Facet overlap score: {top['score']:.1f}"
+            )
+            # Multi-favorite attribution array — each seed's similarity shown
+            # as a display percentage, same scaling as `score`.
+            matched_favorites_display = [
+                {
+                    "name":  mf["name"],
+                    "score": min(100, round(mf["score"] * 4, 1)),
+                    "facets": mf["matched"][:5],
+                }
+                for mf in mfs
+            ]
+            return {
+                "dish_name":        str(cand["dish_name"]),
+                "score":            display_score,
+                "category":         cat,
+                "dietary":          str(cand.get("dietary_type", "")),
+                "protein":          str(cand.get("primary_protein", "") or ""),
+                "description":      "",
+                "why":              why_text,
+                # Backward-compat single fields (top matching seed)
+                "matched_favorite":       top["name"],
+                "matched_favorite_score": display_score,
+                # New: full list of seeds that ranked this dish
+                "matched_favorites":      matched_favorites_display,
+                "course":           cat,
+                "spice_level":      "",
+                "ingredients":      "",
+                "facet_overlap":    round(top["score"], 2),
+                "facet_matches":    top["matched"],
+                "scoring": {
+                    "cosine_sim":          display_score,
+                    "cooking_method":      0,
+                    "ingredient_match":    0,
+                    "temperature_match":   0,
+                    "ingredient_category": 0,
+                    "dietary_compat":      100,
+                },
+            }
+
+        for cat, per_seed in per_seed_by_course.items():
+            visible_entries, hidden_entries = select_with_show_more(
+                per_seed, max_visible=3, max_hidden=6, score_floor=5.0,
+            )
+            # Flat list: first N are visible defaults, rest are revealed via "Show more".
+            entries = [_build_dish_entry(e, cat) for e in visible_entries]
+            entries += [_build_dish_entry(e, cat) for e in hidden_entries]
+            if entries:
+                courses_dict[cat] = entries
 
         all_recommendations[tc] = {
             "cuisine_similarity": c_sim,
             "total_dishes_evaluated": total_eval,
             "courses": courses_dict,
+            "visible_per_course": 3,  # first N entries per course shown by default; rest behind "Show more"
         }
 
     return jsonify({

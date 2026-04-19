@@ -39,6 +39,80 @@ const COURSE_ICONS = {
   "Sides & Breads": "🍞", "Snacks & Street Food": "🥟", "Breakfast": "🍳", "Desserts": "🍮", "Drinks": "🥤",
 };
 
+// Natural meal-progression order used to sort courses consistently across all engines.
+const COURSE_ORDER = [
+  "Appetizer", "Appetizers",
+  "Soup", "Soups",
+  "Salad", "Salads",
+  "Breakfast",
+  "Snacks & Street Food",
+  "Main Course", "Entrees",
+  "Sides & Breads",
+  "Dessert", "Desserts",
+  "Drink", "Drinks",
+];
+function courseRank(name) {
+  const i = COURSE_ORDER.indexOf(name);
+  return i === -1 ? 999 : i;
+}
+function sortedCourseEntries(courses) {
+  return Object.entries(courses || {}).sort(
+    ([a], [b]) => courseRank(a) - courseRank(b)
+  );
+}
+
+// ─ Show-more helpers ─────────────────────────────────────────────────────
+// Split a course's dish list into "visible by default" and "hidden behind
+// Show more". The server sets info.visible_per_course (default 3).
+function splitVisibleHidden(dishes, visiblePerCourse) {
+  const N = Math.max(1, visiblePerCourse || 3);
+  return {
+    visible: dishes.slice(0, N),
+    hidden:  dishes.slice(N),
+  };
+}
+
+// Render "Because you liked …" line. If the dish was matched by multiple
+// favorites (matched_favorites.length > 1), show all of them — so the user
+// sees that one target dish is closer to several of their seeds.
+function matchedFavLine(dish, showScores) {
+  const mfs = Array.isArray(dish.matched_favorites) ? dish.matched_favorites : [];
+  if (mfs.length > 1) {
+    const parts = mfs.map(mf =>
+      `<strong>${mf.name}</strong>${showScores && mf.score != null ? ` (${Math.round(mf.score)}%)` : ""}`
+    );
+    return `Because you liked ${parts.slice(0, -1).join(", ")} and ${parts[parts.length - 1]}`;
+  }
+  if (mfs.length === 1) {
+    const mf = mfs[0];
+    return `Because you liked <strong>${mf.name}</strong>${showScores && mf.score != null ? ` (${Math.round(mf.score)}% similar)` : ""}`;
+  }
+  if (dish.matched_favorite) {
+    return `Because you liked <strong>${dish.matched_favorite}</strong>${showScores && dish.matched_favorite_score != null ? ` (${dish.matched_favorite_score}% similar)` : ""}`;
+  }
+  return "";
+}
+
+let _smUid = 0;
+function nextShowMoreId() { return `sm-${++_smUid}`; }
+
+// Toggle a hidden-dishes block (called inline from the button).
+function toggleShowMore(id, totalHidden) {
+  const box = document.getElementById(id);
+  const btn = document.getElementById(id + "-btn");
+  if (!box || !btn) return;
+  const collapsed = box.getAttribute("data-state") !== "expanded";
+  if (collapsed) {
+    box.setAttribute("data-state", "expanded");
+    box.style.display = "";
+    btn.textContent = "Show less";
+  } else {
+    box.setAttribute("data-state", "collapsed");
+    box.style.display = "none";
+    btn.textContent = `Show ${totalHidden} more`;
+  }
+}
+
 const $ = (sel) => document.querySelector(sel);
 const $$ = (sel) => document.querySelectorAll(sel);
 
@@ -106,22 +180,93 @@ function selectSourceCuisine(name) {
 
 function nextStep1() {
   if (!state.sourceCuisine) return;
-  loadDishes();
+  // Just advance to the Diet step. Dishes load after Tier-1 constraints are set.
   goToStep(2);
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
-//  STEP 2 — Favorite Dishes (grouped by course)
+//  STEP 2 — Diet & Proteins (Tier 1 hard constraints)
+// ══════════════════════════════════════════════════════════════════════════════
+async function nextStep2() {
+  // Load dishes now so the favorites grid is filtered by Tier 1.
+  await loadDishes();
+  goToStep(3);
+}
+
+// ── Tier-1 filter: keep only dishes the user can actually eat ──
+function passesTier1(dish) {
+  const diet = (state.tastePrefs.dietary || "any").toLowerCase();
+  const dishDiet = (dish.dietary || "").toLowerCase();
+  const isVeg = dishDiet.includes("veg") && !dishDiet.includes("non");
+
+  // Dietary filter
+  if (diet === "veg" || diet === "vegan") {
+    if (!isVeg) return false;
+  } else if (diet === "pescatarian") {
+    if (!isVeg) {
+      const prot = (dish.protein || "").toLowerCase();
+      const isFish = /fish|seafood|shrimp|prawn|salmon|tuna|cod|squid|octopus|anchov|sardine/.test(prot);
+      if (!isFish) return false;
+    }
+  }
+  // "any" and "non-veg" impose no dietary filter
+
+  // Protein whitelist (only when non-veg meat dish + whitelist set)
+  if (!isVeg && Array.isArray(state.tastePrefs.allowed_proteins)) {
+    const allowed = state.tastePrefs.allowed_proteins;
+    if (allowed.length === 0) return true; // nothing specified, allow
+    const prot = (dish.protein || "").toLowerCase();
+    if (!prot) return true; // unknown protein on a meat dish — keep, don't over-filter
+    const groups = {
+      chicken: /chicken|poultry/,
+      fish: /fish|seafood|shrimp|prawn|salmon|tuna|cod|squid|octopus|crab|lobster|mussel|clam|anchov|sardine/,
+      lamb: /lamb|mutton|goat/,
+      beef: /beef|veal|ox/,
+      pork: /pork|ham|bacon|sausage/,
+      duck: /duck|quail|rabbit|game/,
+      egg: /^egg/,
+    };
+    const matchesAllowed = allowed.some((a) => (groups[a] || new RegExp(a)).test(prot));
+    if (!matchesAllowed) return false;
+  }
+  return true;
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+//  STEP 3 — Favorite Dishes (grouped by course, Tier-1 filtered)
 // ══════════════════════════════════════════════════════════════════════════════
 async function loadDishes() {
   state.favoriteDishes = [];
   const res = await fetch(`/api/dishes?cuisine=${encodeURIComponent(state.sourceCuisine)}`);
-  state.dishGroups = await res.json();
+  const raw = await res.json();
+  // Apply Tier-1 filter once, per-group
+  state.dishGroups = raw
+    .map((g) => ({ course: g.course, dishes: (g.dishes || []).filter(passesTier1) }))
+    .filter((g) => g.dishes.length > 0);
   // Flatten for search
   state.allDishes = [];
   state.dishGroups.forEach((g) => g.dishes.forEach((d) => state.allDishes.push(d)));
+  renderCourseCounts();
   renderDishesGrouped(state.dishGroups);
   updateDishInfo();
+}
+
+// Compact dietary badge shown on every dish chip so users can tell at a glance
+// what kind of dish they're picking. Covers veg / vegan / non-veg / fish / egg.
+function renderDietBadge(dish) {
+  const diet = (dish.dietary || "").toLowerCase();
+  const prot = (dish.protein || "").toLowerCase();
+  const isVeg = diet.includes("veg") && !diet.includes("non");
+  const isVegan = diet === "vegan";
+  const isFish = /fish|seafood|shrimp|prawn|salmon|tuna|cod|squid|octopus|crab|lobster|mussel|clam|anchov|sardine/.test(prot);
+  const isEgg = /^egg/.test(prot);
+  let cls, txt, title;
+  if (isVegan) { cls = "diet-vegan";   txt = "🌿 Vegan";   title = "Vegan"; }
+  else if (isVeg) { cls = "diet-veg";   txt = "🌱 Veg";     title = "Vegetarian"; }
+  else if (isFish) { cls = "diet-fish"; txt = "🐟 Fish";    title = "Fish / Seafood"; }
+  else if (isEgg) { cls = "diet-egg";   txt = "🥚 Egg";     title = "Egg"; }
+  else { cls = "diet-nonveg"; txt = "🥩 Non-Veg"; title = `Non-Veg${prot ? " · " + dish.protein : ""}`; }
+  return `<span class="diet-badge ${cls}" title="${title}">${txt}</span>`;
 }
 
 function renderDishesGrouped(groups) {
@@ -135,9 +280,9 @@ function renderDishesGrouped(groups) {
       <div class="dish-chips-wrap">`;
     group.dishes.forEach((d) => {
       const sel = state.favoriteDishes.includes(d.name) ? "selected" : "";
-      const dietIcon = d.dietary.toLowerCase().includes("veg") && !d.dietary.toLowerCase().includes("non") ? "🌱" : "";
+      const dietBadge = renderDietBadge(d);
       html += `<div class="dish-chip ${sel}" data-dish="${d.name}" onclick="toggleDish('${d.name.replace(/'/g, "\\'")}')">
-        ${d.name} <span class="cat">${d.category}</span>${dietIcon ? `<span class="diet-tag">${dietIcon}</span>` : ""}
+        ${dietBadge}${d.name} <span class="cat">${d.category}</span>
       </div>`;
     });
     html += `</div></div>`;
@@ -155,11 +300,38 @@ function toggleDish(name) {
   updateDishInfo();
 }
 
+const MIN_FAVORITES = 3;
+
+function renderCourseCounts() {
+  const el = document.getElementById("dish-course-counts");
+  if (!el) return;
+  if (!state.dishGroups || state.dishGroups.length === 0) {
+    el.innerHTML = "";
+    return;
+  }
+  const parts = state.dishGroups.map((g) => {
+    const icon = COURSE_ICONS[g.course] || "🍽";
+    return `<span class="course-count-chip">${icon} ${g.dishes.length} ${g.course}</span>`;
+  });
+  el.innerHTML = `<span class="course-counts-label">Available for you:</span> ${parts.join(" ")}`;
+}
+
 function updateDishInfo() {
   const c = state.favoriteDishes.length;
-  $("#dish-selection-info").textContent =
-    c === 0 ? "Click on dishes you love (select at least 1)" : `${c} dish${c > 1 ? "es" : ""} selected`;
-  $("#btn-step2-next").disabled = c < 1;
+  const totalAvailable = state.allDishes.length;
+  const info = $("#dish-selection-info");
+  if (totalAvailable === 0) {
+    info.textContent =
+      "No dishes match your diet & protein settings for this cuisine. Go back and broaden your preferences.";
+  } else if (c === 0) {
+    info.textContent = `Click on dishes you love (select at least ${MIN_FAVORITES}) — ${totalAvailable} available`;
+  } else if (c < MIN_FAVORITES) {
+    const need = MIN_FAVORITES - c;
+    info.textContent = `${c} selected — pick ${need} more to continue`;
+  } else {
+    info.textContent = `${c} dish${c > 1 ? "es" : ""} selected ✓`;
+  }
+  $("#btn-step3-next").disabled = c < MIN_FAVORITES;
 }
 
 function filterDishes() {
@@ -178,13 +350,13 @@ function filterDishes() {
   renderDishesGrouped(filtered);
 }
 
-function nextStep2() {
-  if (state.favoriteDishes.length < 1) return;
-  goToStep(3);
+function nextStep3() {
+  if (state.favoriteDishes.length < MIN_FAVORITES) return;
+  goToStep(4);
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
-//  STEP 3 — Taste Preferences
+//  STEP 4 — Taste Preferences (soft biases)
 // ══════════════════════════════════════════════════════════════════════════════
 function selectPref(prefKey, value, btn) {
   state.tastePrefs[prefKey] = value;
@@ -200,69 +372,43 @@ function updateTogglePref() {
   state.tastePrefs.likes_sour = $("#pref-sour").checked;
 }
 
-function toggleProteinAny() {
-  const anyCheck = $("#pref-protein-any");
-  const vegCheck = $("#pref-protein-veg");
-  if (anyCheck.checked) {
-    // "Any" turns off Vegetarian and clears all individual proteins
-    if (vegCheck) vegCheck.checked = false;
-    document.querySelectorAll(".protein-check").forEach(cb => {
-      cb.checked = false;
-      cb.disabled = true;
-    });
-  } else {
-    document.querySelectorAll(".protein-check").forEach(cb => { cb.disabled = false; });
-  }
-  state.tastePrefs.allowed_proteins = anyCheck.checked ? "any" : [];
+// Unified dietary selector — sets dietary + reveals/hides the meat sub-panel.
+function selectDiet(value, btn) {
+  state.tastePrefs.dietary = value;
   state.tastePrefs.prefer_vegetarian = false;
-}
+  const parent = btn.closest(".pref-options");
+  parent.querySelectorAll(".pref-btn").forEach((b) => b.classList.remove("selected"));
+  btn.classList.add("selected");
 
-function toggleProteinVeg() {
-  const vegCheck = $("#pref-protein-veg");
-  const anyCheck = $("#pref-protein-any");
-  if (vegCheck.checked) {
-    // Vegetarian preference takes over: clear "Any" and individual meats,
-    // disable individual protein checkboxes (no meat selection makes sense).
-    if (anyCheck) anyCheck.checked = false;
-    document.querySelectorAll(".protein-check").forEach(cb => {
-      cb.checked = false;
-      cb.disabled = true;
-    });
-    state.tastePrefs.allowed_proteins = "any";  // no hard meat filter
-    state.tastePrefs.prefer_vegetarian = true;  // soft re-rank flag
-  } else {
-    // Falling back to "Any" by default
-    if (anyCheck) anyCheck.checked = true;
-    document.querySelectorAll(".protein-check").forEach(cb => { cb.disabled = true; });
+  const panel = document.getElementById("protein-subpanel");
+  if (value === "non-veg") {
+    // Show meat sub-panel; default = all checked = no meat filter.
+    panel.style.display = "";
+    document.querySelectorAll(".protein-check").forEach((cb) => (cb.checked = true));
     state.tastePrefs.allowed_proteins = "any";
-    state.tastePrefs.prefer_vegetarian = false;
+  } else {
+    // Veg / Vegan / Pescatarian / Any — protein filter doesn't apply.
+    panel.style.display = "none";
+    state.tastePrefs.allowed_proteins = "any";
   }
 }
 
+// Only called from within the meat sub-panel.
 function updateProteinPref() {
-  const anyCheck = $("#pref-protein-any");
-  const vegCheck = $("#pref-protein-veg");
-  // Selecting an individual protein turns Vegetarian off
-  if (vegCheck && vegCheck.checked) vegCheck.checked = false;
-  state.tastePrefs.prefer_vegetarian = false;
-  const checked = Array.from(document.querySelectorAll(".protein-check:checked")).map(cb => cb.dataset.protein);
-  if (checked.length === 0) {
-    anyCheck.checked = true;
-    document.querySelectorAll(".protein-check").forEach(cb => cb.disabled = true);
-    state.tastePrefs.allowed_proteins = "any";
-  } else {
-    anyCheck.checked = false;
-    state.tastePrefs.allowed_proteins = checked;
-  }
+  const checked = Array.from(document.querySelectorAll(".protein-check:checked")).map((cb) => cb.dataset.protein);
+  const all = document.querySelectorAll(".protein-check").length;
+  // If all (or none) checked, treat as "any" — no hard filter.
+  state.tastePrefs.allowed_proteins =
+    checked.length === 0 || checked.length === all ? "any" : checked;
 }
 
-function nextStep3() {
+function nextStep4() {
   renderTargetCuisines();
-  goToStep(4);
+  goToStep(5);
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
-//  STEP 4 — Target Cuisines
+//  STEP 5 — Target Cuisines
 // ══════════════════════════════════════════════════════════════════════════════
 function renderTargetCuisines() {
   renderCuisineGrid("target-cuisine-grid", state.cuisines, toggleTargetCuisine, [state.sourceCuisine]);
@@ -290,10 +436,10 @@ function updateTargetInfo() {
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
-//  STEP 5 — Recommendations (grouped by course)
+//  STEP 6 — Recommendations (grouped by course)
 // ══════════════════════════════════════════════════════════════════════════════
 async function getRecommendations() {
-  goToStep(5);
+  goToStep(6);
 
   const payload = JSON.stringify({
     source_cuisine: state.sourceCuisine,
@@ -357,7 +503,7 @@ function renderResults(data) {
       favByCourse[f.course].push(f.name);
     });
     html += `<div class="fav-summary"><strong>Your favorites:</strong> `;
-    for (const [course, names] of Object.entries(favByCourse)) {
+    for (const [course, names] of sortedCourseEntries(favByCourse)) {
       html += `<span class="fav-course-group">${COURSE_ICONS[course] || ""} ${course}: ${names.join(", ")}</span> `;
     }
     html += `</div>`;
@@ -412,14 +558,25 @@ function renderResults(data) {
       html += `<p style="color:var(--text-muted);padding:1rem">No dishes match your dietary preference in this cuisine.</p>`;
     }
 
-    for (const [courseName, dishes] of Object.entries(courses)) {
+    for (const [courseName, dishes] of sortedCourseEntries(courses)) {
       const courseIcon = COURSE_ICONS[courseName] || "🍽";
+      const { visible, hidden } = splitVisibleHidden(dishes, info.visible_per_course);
       html += `<div class="course-result-section">
-        <h4 class="course-result-header">${courseIcon} ${courseName} <span class="course-count">(${dishes.length} picks)</span></h4>`;
+        <h4 class="course-result-header">${courseIcon} ${courseName} <span class="course-count">(${visible.length}${hidden.length ? "+" + hidden.length : ""} picks)</span></h4>`;
 
-      dishes.forEach((dish, i) => {
+      visible.forEach((dish, i) => {
         html += renderDishCard(dish, i, data.user_profile);
       });
+
+      if (hidden.length) {
+        const id = nextShowMoreId();
+        html += `<div id="${id}" class="hidden-dishes" data-state="collapsed" style="display:none">`;
+        hidden.forEach((dish, i) => {
+          html += renderDishCard(dish, visible.length + i, data.user_profile);
+        });
+        html += `</div>`;
+        html += `<button id="${id}-btn" class="show-more-btn" onclick="toggleShowMore('${id}', ${hidden.length})">Show ${hidden.length} more</button>`;
+      }
 
       html += `</div>`;
     }
@@ -500,13 +657,23 @@ function renderComparisonResults(engineResults) {
           if (Object.keys(courses).length === 0) {
             html += `<div class="comparison-error">No matching dishes</div>`;
           } else {
-            for (const [courseName, dishes] of Object.entries(courses)) {
+            for (const [courseName, dishes] of sortedCourseEntries(courses)) {
               const courseIcon = COURSE_ICONS[courseName] || "🍽";
+              const { visible, hidden } = splitVisibleHidden(dishes, info.visible_per_course);
               html += `<div class="comparison-course">
                 <h5 class="comparison-course-title">${courseIcon} ${courseName}</h5>`;
-              dishes.forEach((dish, i) => {
+              visible.forEach((dish, i) => {
                 html += renderCompactCard(dish, i, eng.key);
               });
+              if (hidden.length) {
+                const id = nextShowMoreId();
+                html += `<div id="${id}" class="hidden-dishes" data-state="collapsed" style="display:none">`;
+                hidden.forEach((dish, i) => {
+                  html += renderCompactCard(dish, visible.length + i, eng.key);
+                });
+                html += `</div>`;
+                html += `<button id="${id}-btn" class="show-more-btn show-more-btn-compact" onclick="toggleShowMore('${id}', ${hidden.length})">Show ${hidden.length} more</button>`;
+              }
               html += `</div>`;
             }
           }
@@ -531,7 +698,7 @@ function renderCompactCard(dish, i, engineKey) {
       <span class="compact-rank">${i + 1}</span>
       <div class="compact-info">
         <strong>${dish.dish_name}</strong>
-        ${dish.matched_favorite ? `<div class="compact-match">Because you liked <em>${dish.matched_favorite}</em></div>` : ""}
+        ${(() => { const l = matchedFavLine(dish, false); return l ? `<div class="compact-match">${l}</div>` : ""; })()}
         <div class="compact-meta">
           <span>${dish.category || ""}</span>
           <span>${dish.dietary || ""}</span>
@@ -619,9 +786,10 @@ function renderDishCard(dish, i, userProfile) {
       <div class="result-info">
         <h4>${dish.dish_name}</h4>`;
 
-  // "Because you liked X" badge
-  if (dish.matched_favorite) {
-    html += `<div class="matched-fav-badge">Because you liked <strong>${dish.matched_favorite}</strong>${!isAI ? ` (${dish.matched_favorite_score}% similar)` : ''}</div>`;
+  // "Because you liked X" badge (supports multi-favorite attribution)
+  {
+    const line = matchedFavLine(dish, !isAI);
+    if (line) html += `<div class="matched-fav-badge">${line}</div>`;
   }
 
   html += `<div class="result-meta">
@@ -856,6 +1024,10 @@ function startOver() {
   $$('.pref-btn[data-val="any"]').forEach((b) => b.classList.add("selected"));
   $$('.pref-btn[data-val="medium"]').forEach((b) => b.classList.add("selected"));
   $$("#pref-creamy, #pref-aromatic, #pref-sweet, #pref-sour").forEach((cb) => (cb.checked = false));
+  // Reset unified dietary UI: hide protein sub-panel, re-check all meats (default)
+  const panel = document.getElementById("protein-subpanel");
+  if (panel) panel.style.display = "none";
+  $$(".protein-check").forEach((cb) => (cb.checked = true));
   goToStep(1);
 }
 
