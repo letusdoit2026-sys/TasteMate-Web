@@ -6,8 +6,7 @@ numpy==2.0.2
 gunicorn==23.0.0
 groq==1.1.1
 google-genai==1.66.0
-faiss-cpu==1.9.0.post1
-sentence-transformers
+sentence-transformers   # used only by scripts/ingest_dishes.py (not at runtime)
 python-dotenv==1.0.1
 openai==1.78.0
 psycopg[binary]==3.2.3
