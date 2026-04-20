@@ -4,3 +4,12 @@ __pycache__/
 venv/
 .DS_Store
 data/tastemate.db
+
+# Local agent config
+.claude/
+
+# Backups and intermediate checkpoint files
+*.bak
+data/*.bak
+data/*_checkpoint.csv
+data/dishes_backup_*.csv

@@ -147,7 +147,22 @@ body {
 .dish-chip:hover { border-color: var(--primary); }
 .dish-chip.selected { border-color: var(--primary); background: var(--primary); color: white; }
 .dish-chip .cat { font-size: 0.72rem; opacity: 0.7; margin-left: 4px; }
-.dish-chip .diet-tag { font-size: 0.65rem; margin-left: 3px; opacity: 0.8; }
+
+/* Dietary badge shown on every dish chip (veg / vegan / non-veg / fish / egg). */
+.diet-badge {
+  display: inline-block;
+  font-size: 0.65rem; font-weight: 600;
+  padding: 2px 7px; border-radius: 999px;
+  margin-right: 6px; vertical-align: middle;
+  line-height: 1.4; white-space: nowrap;
+}
+.diet-badge.diet-veg     { background: #dcfce7; color: #15803d; border: 1px solid #bbf7d0; }
+.diet-badge.diet-vegan   { background: #d1fae5; color: #047857; border: 1px solid #a7f3d0; }
+.diet-badge.diet-fish    { background: #dbeafe; color: #1d4ed8; border: 1px solid #bfdbfe; }
+.diet-badge.diet-egg     { background: #fef3c7; color: #a16207; border: 1px solid #fde68a; }
+.diet-badge.diet-nonveg  { background: #fee2e2; color: #b91c1c; border: 1px solid #fecaca; }
+/* When a chip is selected (green filled), badge stays legible on green bg */
+.dish-chip.selected .diet-badge { opacity: 0.95; }
 
 /* ── Search Box ── */
 .search-box {
@@ -161,6 +176,18 @@ body {
   background: var(--primary-light); border-radius: var(--radius-sm);
   padding: 0.5rem 1rem; margin-bottom: 1rem;
   font-size: 0.88rem; font-weight: 500; color: var(--primary-dark);
+}
+
+/* Per-course availability chip strip shown above the dish grid */
+.course-counts {
+  display: flex; flex-wrap: wrap; align-items: center; gap: 0.4rem;
+  margin: 0.25rem 0 0.75rem; font-size: 0.82rem; color: var(--text-muted);
+}
+.course-counts:empty { display: none; }
+.course-counts-label { font-weight: 600; color: var(--text-muted); margin-right: 0.25rem; }
+.course-count-chip {
+  background: #f1f5f9; color: #334155; border: 1px solid #e2e8f0;
+  padding: 0.2rem 0.6rem; border-radius: 999px; font-weight: 500;
 }
 
 /* ── Buttons ── */
@@ -781,6 +808,59 @@ body {
 @media (max-width: 700px) {
   .comparison-grid { grid-template-columns: 1fr; }
 }
+
+/* ─ Auto-inferred dietary banner ─────────────────────────────────── */
+.auto-infer-banner {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.7rem;
+  padding: 0.75rem 1rem;
+  background: #f0fdf4;
+  border: 1px solid #bbf7d0;
+  border-left: 4px solid #16a34a;
+  border-radius: 10px;
+  margin: 0 0 1rem;
+  font-size: 0.88rem;
+  color: #14532d;
+  line-height: 1.45;
+}
+.auto-infer-banner .auto-infer-icon {
+  font-size: 1.2rem;
+  line-height: 1;
+  margin-top: 1px;
+}
+.auto-infer-banner a {
+  color: #15803d;
+  font-weight: 600;
+  text-decoration: underline;
+  margin-left: 0.25rem;
+}
+.auto-infer-banner a:hover { color: #14532d; }
+
+/* ─ Show more / Show less toggle ─────────────────────────────────── */
+.show-more-btn {
+  display: block;
+  margin: 0.6rem auto 0.3rem;
+  padding: 0.45rem 1.1rem;
+  background: #f1f5f9;
+  border: 1px dashed #cbd5e1;
+  border-radius: 999px;
+  color: var(--primary, #16a34a);
+  font-weight: 600;
+  font-size: 0.82rem;
+  cursor: pointer;
+  transition: background 0.15s, border-color 0.15s;
+}
+.show-more-btn:hover {
+  background: #e2e8f0;
+  border-color: #94a3b8;
+}
+.show-more-btn-compact {
+  padding: 0.3rem 0.75rem;
+  font-size: 0.75rem;
+  margin: 0.4rem auto 0.1rem;
+}
+.hidden-dishes[data-state="collapsed"] { display: none !important; }
 
 /* Safe area for notched phones (iPhone X+) */
 @supports (padding: env(safe-area-inset-bottom)) {
