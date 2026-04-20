@@ -4,7 +4,6 @@ load_dotenv()  # Load .env file before any os.environ.get() calls
 
 import json
 import uuid
-import sqlite3
 import datetime
 import numpy as np
 import pandas as pd
@@ -16,12 +15,12 @@ import groq
 from google import genai as google_genai
 from openai import OpenAI as XAIClient
 from hybrid_engine import HybridEngine
+from db import get_db as _pg_get_db, close_db as _pg_close_db, init_db as _pg_init_db
 
 # ── App setup ──
 app = Flask(__name__)
 app.secret_key = os.environ.get("SECRET_KEY", "")
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-DB_PATH = os.path.join(BASE_DIR, "data", "tastemate.db")
 
 bcrypt = Bcrypt(app)
 login_manager = LoginManager(app)
@@ -178,51 +177,16 @@ except Exception as e:
 # ══════════════════════════════════════════════════════��═══════════════════════
 
 def get_db():
-    if "db" not in g:
-        g.db = sqlite3.connect(DB_PATH)
-        g.db.row_factory = sqlite3.Row
-    return g.db
+    return _pg_get_db()
 
 
 @app.teardown_appcontext
 def close_db(exception):
-    db = g.pop("db", None)
-    if db is not None:
-        db.close()
+    _pg_close_db(exception)
 
 
 def init_db():
-    db = sqlite3.connect(DB_PATH)
-    db.executescript("""
-        CREATE TABLE IF NOT EXISTS users (
-            id TEXT PRIMARY KEY,
-            username TEXT UNIQUE NOT NULL,
-            email TEXT UNIQUE NOT NULL,
-            password_hash TEXT NOT NULL,
-            security_question TEXT,
-            security_answer_hash TEXT,
-            created_at TEXT NOT NULL
-        );
-        CREATE TABLE IF NOT EXISTS audit_logs (
-            id TEXT PRIMARY KEY,
-            user_id TEXT NOT NULL,
-            username TEXT NOT NULL,
-            action TEXT NOT NULL,
-            timestamp TEXT NOT NULL,
-            source_cuisine TEXT,
-            favorite_dishes TEXT,
-            taste_preferences TEXT,
-            target_cuisines TEXT,
-            recommendations TEXT,
-            scoring_details TEXT,
-            user_profile_vector TEXT,
-            FOREIGN KEY (user_id) REFERENCES users(id)
-        );
-        CREATE INDEX IF NOT EXISTS idx_audit_user ON audit_logs(user_id);
-        CREATE INDEX IF NOT EXISTS idx_audit_ts ON audit_logs(timestamp);
-    """)
-    db.commit()
-    db.close()
+    _pg_init_db()
 
 
 init_db()
@@ -242,7 +206,7 @@ class User(UserMixin):
 @login_manager.user_loader
 def load_user(user_id):
     db = get_db()
-    row = db.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
+    row = db.execute("SELECT * FROM users WHERE id = %s", (user_id,)).fetchone()
     if row:
         return User(row["id"], row["username"], row["email"])
     return None
@@ -253,26 +217,31 @@ def load_user(user_id):
 # ══════════════════════════════════════════════════════════════════════════════
 
 def log_audit(user_id, username, action, **kwargs):
+    from psycopg.types.json import Jsonb
+
+    def _j(v):
+        return Jsonb(v) if v else None
+
     db = get_db()
     db.execute(
         """INSERT INTO audit_logs
            (id, user_id, username, action, timestamp,
             source_cuisine, favorite_dishes, taste_preferences,
             target_cuisines, recommendations, scoring_details, user_profile_vector)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+           VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
         (
             str(uuid.uuid4()),
             user_id,
             username,
             action,
-            datetime.datetime.utcnow().isoformat(),
+            datetime.datetime.utcnow(),
             kwargs.get("source_cuisine"),
-            json.dumps(kwargs.get("favorite_dishes")) if kwargs.get("favorite_dishes") else None,
-            json.dumps(kwargs.get("taste_preferences")) if kwargs.get("taste_preferences") else None,
-            json.dumps(kwargs.get("target_cuisines")) if kwargs.get("target_cuisines") else None,
-            json.dumps(kwargs.get("recommendations")) if kwargs.get("recommendations") else None,
-            json.dumps(kwargs.get("scoring_details")) if kwargs.get("scoring_details") else None,
-            json.dumps(kwargs.get("user_profile_vector")) if kwargs.get("user_profile_vector") else None,
+            _j(kwargs.get("favorite_dishes")),
+            _j(kwargs.get("taste_preferences")),
+            _j(kwargs.get("target_cuisines")),
+            _j(kwargs.get("recommendations")),
+            _j(kwargs.get("scoring_details")),
+            _j(kwargs.get("user_profile_vector")),
         ),
     )
     db.commit()
@@ -699,7 +668,7 @@ def api_forgot_get_question():
         return jsonify({"error": "Please enter your email"}), 400
 
     db = get_db()
-    row = db.execute("SELECT security_question FROM users WHERE email = ?", (email,)).fetchone()
+    row = db.execute("SELECT security_question FROM users WHERE email = %s", (email,)).fetchone()
     if not row:
         return jsonify({"error": "No account found with that email"}), 404
     if not row["security_question"]:
@@ -720,7 +689,7 @@ def api_forgot_reset():
         return jsonify({"error": "Email and security answer are required"}), 400
 
     db = get_db()
-    row = db.execute("SELECT * FROM users WHERE email = ?", (email,)).fetchone()
+    row = db.execute("SELECT * FROM users WHERE email = %s", (email,)).fetchone()
     if not row:
         return jsonify({"error": "No account found with that email"}), 404
 
@@ -730,7 +699,7 @@ def api_forgot_reset():
 
     # Reset password to "tastemate"
     new_hash = bcrypt.generate_password_hash("tastemate").decode("utf-8")
-    db.execute("UPDATE users SET password_hash = ? WHERE email = ?", (new_hash, email))
+    db.execute("UPDATE users SET password_hash = %s WHERE email = %s", (new_hash, email))
     db.commit()
 
     log_audit(row["id"], row["username"], "PASSWORD_RESET_VIA_SECURITY_QUESTION")
@@ -752,7 +721,7 @@ def api_register():
         return jsonify({"error": "Security question and answer are required for password recovery"}), 400
 
     db = get_db()
-    existing = db.execute("SELECT id FROM users WHERE username = ? OR email = ?", (username, email)).fetchone()
+    existing = db.execute("SELECT id FROM users WHERE username = %s OR email = %s", (username, email)).fetchone()
     if existing:
         return jsonify({"error": "Username or email already exists"}), 400
 
@@ -761,8 +730,8 @@ def api_register():
     answer_hash = bcrypt.generate_password_hash(security_answer).decode("utf-8")
     db.execute(
         """INSERT INTO users (id, username, email, password_hash, security_question, security_answer_hash, created_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?)""",
-        (user_id, username, email, pw_hash, security_question, answer_hash, datetime.datetime.utcnow().isoformat()),
+           VALUES (%s, %s, %s, %s, %s, %s, %s)""",
+        (user_id, username, email, pw_hash, security_question, answer_hash, datetime.datetime.utcnow()),
     )
     db.commit()
 
@@ -779,7 +748,7 @@ def api_login():
     password = data.get("password", "")
 
     db = get_db()
-    row = db.execute("SELECT * FROM users WHERE email = ?", (email,)).fetchone()
+    row = db.execute("SELECT * FROM users WHERE email = %s", (email,)).fetchone()
     if not row or not bcrypt.check_password_hash(row["password_hash"], password):
         return jsonify({"error": "Invalid email or password"}), 401
 
@@ -2389,21 +2358,22 @@ def my_audit_history():
     db = get_db()
     rows = db.execute(
         """SELECT * FROM audit_logs
-           WHERE user_id = ? AND action = 'RECOMMENDATION'
+           WHERE user_id = %s AND action = 'RECOMMENDATION'
            ORDER BY timestamp DESC LIMIT 20""",
         (current_user.id,),
     ).fetchall()
     results = []
     for row in rows:
+        ts = row["timestamp"]
         results.append({
             "id": row["id"],
-            "timestamp": row["timestamp"],
+            "timestamp": ts.isoformat() if hasattr(ts, "isoformat") else ts,
             "source_cuisine": row["source_cuisine"],
-            "favorite_dishes": json.loads(row["favorite_dishes"]) if row["favorite_dishes"] else [],
-            "taste_preferences": json.loads(row["taste_preferences"]) if row["taste_preferences"] else {},
-            "target_cuisines": json.loads(row["target_cuisines"]) if row["target_cuisines"] else [],
-            "recommendations": json.loads(row["recommendations"]) if row["recommendations"] else {},
-            "user_profile_vector": json.loads(row["user_profile_vector"]) if row["user_profile_vector"] else {},
+            "favorite_dishes": row["favorite_dishes"] or [],
+            "taste_preferences": row["taste_preferences"] or {},
+            "target_cuisines": row["target_cuisines"] or [],
+            "recommendations": row["recommendations"] or {},
+            "user_profile_vector": row["user_profile_vector"] or {},
         })
     return jsonify(results)
 
@@ -2412,19 +2382,20 @@ def my_audit_history():
 @login_required
 def audit_detail(log_id):
     db = get_db()
-    row = db.execute("SELECT * FROM audit_logs WHERE id = ? AND user_id = ?", (log_id, current_user.id)).fetchone()
+    row = db.execute("SELECT * FROM audit_logs WHERE id = %s AND user_id = %s", (log_id, current_user.id)).fetchone()
     if not row:
         return jsonify({"error": "Not found"}), 404
+    ts = row["timestamp"]
     return jsonify({
         "id": row["id"],
-        "timestamp": row["timestamp"],
+        "timestamp": ts.isoformat() if hasattr(ts, "isoformat") else ts,
         "source_cuisine": row["source_cuisine"],
-        "favorite_dishes": json.loads(row["favorite_dishes"]) if row["favorite_dishes"] else [],
-        "taste_preferences": json.loads(row["taste_preferences"]) if row["taste_preferences"] else {},
-        "target_cuisines": json.loads(row["target_cuisines"]) if row["target_cuisines"] else [],
-        "recommendations": json.loads(row["recommendations"]) if row["recommendations"] else {},
-        "scoring_details": json.loads(row["scoring_details"]) if row["scoring_details"] else {},
-        "user_profile_vector": json.loads(row["user_profile_vector"]) if row["user_profile_vector"] else {},
+        "favorite_dishes": row["favorite_dishes"] or [],
+        "taste_preferences": row["taste_preferences"] or {},
+        "target_cuisines": row["target_cuisines"] or [],
+        "recommendations": row["recommendations"] or {},
+        "scoring_details": row["scoring_details"] or {},
+        "user_profile_vector": row["user_profile_vector"] or {},
     })
 
 
