@@ -1,13 +1,16 @@
 """
 Hybrid Intersection Recommendation Engine
 ==========================================
-3-file, 6-step pipeline:
-  1. Hard Filtering    (Metadata_Filters.csv)
-  2. Semantic Recall   (vibe_category.csv → FAISS)
-  3. Threshold Guard   (taste_chemistry.csv mouthfeel)
-  4. Euclidean Rank    (taste_chemistry.csv flavor distance)
+Postgres + pgvector 6-step pipeline:
+  1. Hard Filtering    (dishes table — boolean masks on in-memory DataFrame)
+  2. Semantic Recall   (pgvector cosine — replaces FAISS)
+  3. Threshold Guard   (flavor mouthfeel)
+  4. Euclidean Rank    (flavor distance)
   5. Cuisine Bridge    (discovery bonus)
   6. Tie-Breaking      (importance)
+
+Data source: Postgres `dishes` table (loaded once at __init__).
+Embeddings:  pulled from the VECTOR(384) column — no re-encoding at startup.
 """
 
 from __future__ import annotations
@@ -15,8 +18,7 @@ from __future__ import annotations
 import os
 import numpy as np
 import pandas as pd
-import faiss
-from sentence_transformers import SentenceTransformer
+from pgvector.psycopg import register_vector
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  CONSTANTS
@@ -94,70 +96,115 @@ ALL_MEAT_PROTEINS.add("Mixed")
 
 
 class HybridEngine:
-    """Three-file hybrid recommendation engine."""
+    """Postgres-backed hybrid recommendation engine (pgvector for semantic recall)."""
 
     def __init__(self, data_dir, similarity_csv=None):
+        # data_dir is kept for backward compat (used only for similarity.csv).
         self.data_dir = data_dir
 
-        # ── Load the three CSVs ──
-        self.taste = pd.read_csv(os.path.join(data_dir, "taste_chemistry.csv"))
-        self.vibe = pd.read_csv(os.path.join(data_dir, "vibe_category.csv"))
-        self.meta = pd.read_csv(os.path.join(data_dir, "Metadata_Filters.csv"))
+        # ── Load all dishes from Postgres into an in-memory DataFrame ──
+        # At 668 dishes this is ~a few MB; filters use vectorised numpy masks.
+        # Postgres is the source of truth; this is the working set.
+        from db import _pool
+        with _pool.connection() as conn:
+            register_vector(conn)
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT dish_id, dish_name, cuisine, category, dietary_type,
+                           temp, importance, primary_protein,
+                           sweet, salt, sour, bitter, umami, spicy, fat,
+                           aromatic, crunch, chew,
+                           context_string, facets, embedding
+                    FROM dishes
+                    ORDER BY dish_id
+                """)
+                rows = cur.fetchall()
 
-        # Clean: drop duplicate header rows, trailing empty columns
-        for df in (self.taste, self.vibe, self.meta):
-            df.drop(df[df["dish_name"] == "dish_name"].index, inplace=True)
-            df.drop(columns=[c for c in df.columns if c.startswith("Unnamed")], errors="ignore", inplace=True)
-            df.reset_index(drop=True, inplace=True)
+        if not rows:
+            raise RuntimeError(
+                "dishes table is empty — run `python3 scripts/ingest_dishes.py` first."
+            )
 
-        # Convert flavor columns to numeric
-        for col in FLAVOR_DIMS:
-            if col in self.taste.columns:
-                self.taste[col] = pd.to_numeric(self.taste[col], errors="coerce").fillna(0.0)
+        # Build the DataFrame (same schema the rest of the engine expects)
+        self.dishes = pd.DataFrame(rows)
+        # Coerce flavor dims + importance to float
+        for col in FLAVOR_DIMS + ["importance"]:
+            if col in self.dishes.columns:
+                self.dishes[col] = pd.to_numeric(
+                    self.dishes[col], errors="coerce",
+                ).fillna(0.0)
 
-        # Normalise dish names
-        for df in (self.taste, self.vibe, self.meta):
-            df["dish_name"] = df["dish_name"].str.strip()
-            if "cuisine" in df.columns:
-                df["cuisine"] = df["cuisine"].str.strip()
+        # Extract embeddings as a single (N, 384) numpy matrix.
+        # Kept in memory for fast access when we batch-compute during pipeline
+        # fallbacks, but the primary semantic-recall path uses pgvector (below).
+        self.embeddings = np.vstack(self.dishes["embedding"].tolist()).astype(np.float32)
+        self.dishes = self.dishes.drop(columns=["embedding"])
 
-        # Use (dish_name, cuisine) as composite join key to handle
-        # same dish names across different cuisines (e.g. Grilled Octopus)
-        join_keys = ["dish_name", "cuisine"]
-
-        # Merge into a single lookup
-        self.dishes = (
-            self.meta
-            .merge(self.taste, on=join_keys, how="inner")
-            .merge(self.vibe, on=join_keys, how="inner")
-        )
-        self.dishes.reset_index(drop=True, inplace=True)
-
-        # ── Cuisine similarity matrix (optional) ──
+        # ── Cuisine similarity matrix (optional, still CSV for now) ──
         self.sim_df = None
         if similarity_csv and os.path.exists(similarity_csv):
             self.sim_df = pd.read_csv(similarity_csv, index_col=0)
 
-        # ── Build flavour matrix (NumPy, vectorised) ──
+        # ── Flavour matrix (NumPy, vectorised for Euclidean step) ──
         self.flavor_matrix = self.dishes[FLAVOR_DIMS].values.astype(np.float32)
 
-        # ── Build FAISS index on context_string embeddings ──
-        self.model = SentenceTransformer(EMBED_MODEL_NAME)
-        # context_string is already in self.dishes after merge
-        ordered_contexts = self.dishes["context_string"].fillna("").tolist()
-        self.embeddings = self.model.encode(
-            ordered_contexts, show_progress_bar=False, normalize_embeddings=True,
-        ).astype(np.float32)
-
-        dim = self.embeddings.shape[1]
-        self.index = faiss.IndexFlatIP(dim)  # Inner-product on L2-normed = cosine
-        self.index.add(self.embeddings)
-
-        # Name → row mapping (dish names may not be unique, so first match wins)
+        # Name → row mapping (dish names may not be unique → first match wins)
         self._name_to_idx = {}
         for i, name in enumerate(self.dishes["dish_name"]):
             if name not in self._name_to_idx:
                 self._name_to_idx[name] = i
+
+        # dish_id → row index mapping (used to map pgvector results back to
+        # DataFrame rows)
+        self._id_to_idx = {
+            int(did): i for i, did in enumerate(self.dishes["dish_id"].tolist())
+        }
+
+    # ──────────────────────────────────────────────────────────────────────
+    #  Semantic recall via pgvector (replaces FAISS)
+    # ──────────────────────────────────────────────────────────────────────
+    def _semantic_recall(
+        self,
+        seed_idx: int,
+        eligible_indices: np.ndarray,
+        k: int,
+    ) -> list[tuple[int, float]]:
+        """
+        Return up to `k` (row_idx, cosine_score) pairs from `eligible_indices`,
+        ranked by cosine similarity to the seed's embedding — using pgvector.
+
+        Uses `<=>` (cosine distance): score = 1 - distance, so larger is closer.
+        """
+        from db import _pool
+
+        seed_emb = self.embeddings[seed_idx]
+        # Map pandas row indices → dish_ids for the WHERE clause
+        eligible_ids = self.dishes.iloc[eligible_indices]["dish_id"].astype(int).tolist()
+        if not eligible_ids:
+            return []
+
+        with _pool.connection() as conn:
+            register_vector(conn)
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT dish_id,
+                           1 - (embedding <=> %s::vector) AS score
+                    FROM dishes
+                    WHERE dish_id = ANY(%s)
+                    ORDER BY embedding <=> %s::vector
+                    LIMIT %s
+                    """,
+                    (seed_emb, eligible_ids, seed_emb, k),
+                )
+                rows = cur.fetchall()
+
+        out: list[tuple[int, float]] = []
+        for r in rows:
+            idx = self._id_to_idx.get(int(r["dish_id"]))
+            if idx is not None and idx != seed_idx:
+                out.append((idx, float(r["score"])))
+        return out
 
     # ──────────────────────────────────────────────────────────────────────
     #  PUBLIC API
@@ -326,18 +373,11 @@ class HybridEngine:
         seed_temp = str(seed_row["temp"]).strip().lower()
         seed_flavor = self.flavor_matrix[seed_idx]
 
-        # ── Step 2: Semantic Recall (FAISS top-30) ───────────────────────
-        seed_embedding = self.embeddings[seed_idx].reshape(1, -1)
-        k_search = min(len(self.dishes), SEMANTIC_TOP_K * 5)
-        scores, idxs = self.index.search(seed_embedding, k_search)
-
-        eligible_set = set(eligible_indices)
-        semantic_candidates = []
-        for score, idx in zip(scores[0], idxs[0]):
-            if idx in eligible_set:
-                semantic_candidates.append((idx, float(score)))
-            if len(semantic_candidates) >= SEMANTIC_TOP_K:
-                break
+        # ── Step 2: Semantic Recall (pgvector cosine top-K) ──────────────
+        # Pre-filter via `dish_id = ANY(...)` and let Postgres rank.
+        semantic_candidates = self._semantic_recall(
+            seed_idx, eligible_indices, k=SEMANTIC_TOP_K,
+        )
 
         if not semantic_candidates:
             return [], {"semantic_recall": 0, "mouthfeel_guard": 0}

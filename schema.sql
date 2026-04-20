@@ -81,6 +81,61 @@ CREATE INDEX IF NOT EXISTS idx_persona_centroid
     WITH (lists = 100);
 
 -- ───────────────────────────────────────────────────────────────────────────
+--  Dishes — source-of-truth for the recommendation engine
+--  Replaces taste_chemistry.csv + vibe_category.csv + Metadata_Filters.csv
+--  + dish_facets.csv (joined on dish_name + cuisine).
+-- ───────────────────────────────────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS dishes (
+    -- Composite natural key (same dish_name can exist across cuisines)
+    dish_id         SERIAL PRIMARY KEY,
+    dish_name       TEXT NOT NULL,
+    cuisine         TEXT NOT NULL,
+
+    -- From Metadata_Filters.csv
+    category            TEXT,
+    dietary_type        TEXT,
+    temp                TEXT,
+    importance          REAL,
+    primary_protein     TEXT,
+
+    -- From taste_chemistry.csv (13 flavor dims — app.py has 13, engine uses 10)
+    sweet       REAL DEFAULT 0,
+    salt        REAL DEFAULT 0,
+    sour        REAL DEFAULT 0,
+    bitter      REAL DEFAULT 0,
+    umami       REAL DEFAULT 0,
+    spicy       REAL DEFAULT 0,
+    fat         REAL DEFAULT 0,
+    aromatic    REAL DEFAULT 0,
+    crunch      REAL DEFAULT 0,
+    chew        REAL DEFAULT 0,
+
+    -- From vibe_category.csv
+    context_string  TEXT,
+
+    -- Facets (from dish_facets.csv) — kept as JSONB for flexibility
+    facets          JSONB,
+
+    -- Semantic embedding (384-d, from sentence-transformers all-MiniLM-L6-v2,
+    -- L2-normalised so cosine distance = 1 - dot product)
+    embedding       VECTOR(384),
+
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+
+    UNIQUE (dish_name, cuisine)
+);
+
+CREATE INDEX IF NOT EXISTS idx_dishes_cuisine  ON dishes(cuisine);
+CREATE INDEX IF NOT EXISTS idx_dishes_category ON dishes(category);
+
+-- ANN index for semantic recall (cosine). ivfflat needs rows before it
+-- performs well; for now lists=50 is fine at 668 rows and will scale.
+CREATE INDEX IF NOT EXISTS idx_dishes_embedding
+    ON dishes USING ivfflat (embedding vector_cosine_ops)
+    WITH (lists = 50);
+
+-- ───────────────────────────────────────────────────────────────────────────
 --  Groups — for group dining recommendations
 -- ───────────────────────────────────────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS groups (
