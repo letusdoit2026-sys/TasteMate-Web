@@ -847,6 +847,234 @@ def canonical_category(c):
     return _COURSE_CANONICAL.get(raw.lower(), raw)
 
 
+def humanize_facet_reasons(matched, max_values=6):
+    """Turn raw facet tokens like 'flavor:smoky,umami-rich' into a human-
+    readable phrase. Layer-1 formatting: strip the `category:` prefix, split
+    comma-packed values, dedupe while preserving order, and join with ", ".
+
+    Example input (list of tokens the facet engine returned):
+      ['flavor:smoky,umami-rich', 'texture:charred-crust,juicy-interior',
+       'heat_intensity:high-dry-heat', 'fat_character:rendered-meat',
+       'richness:rich']
+    Output: 'smoky, umami-rich, charred-crust, juicy-interior,
+             high-dry-heat, rendered-meat'
+    """
+    if not matched:
+        return ""
+    seen = []
+    for tok in matched:
+        if not tok:
+            continue
+        # Split "category:value1,value2" → just the value side
+        raw = str(tok)
+        body = raw.split(":", 1)[1] if ":" in raw else raw
+        for v in body.split(","):
+            v = v.strip().replace("_", " ")
+            if v and v not in seen:
+                seen.append(v)
+    return ", ".join(seen[:max_values])
+
+
+# ── Layer 2: natural-language facet phrasing ──
+# Maps facet category → (priority, phrase builder). Builder takes the list of
+# human-readable values for that category and returns a fragment like
+# "smoky, umami-rich flavors". Fragments are joined in priority order into a
+# single sentence. Unknown categories fall through to a generic "with X" tail,
+# so we degrade gracefully rather than silently dropping signal.
+def _fmt_list(vals, max_n=3):
+    vals = vals[:max_n]
+    if not vals:
+        return ""
+    if len(vals) == 1:
+        return vals[0]
+    if len(vals) == 2:
+        return f"{vals[0]} and {vals[1]}"
+    return ", ".join(vals[:-1]) + f", and {vals[-1]}"
+
+
+_FACET_PHRASERS = {
+    # Flavor anchors — the headline. "smoky, umami-rich flavors"
+    "flavor_anchors":   (10, lambda vs: f"{_fmt_list(vs)} flavors"),
+    "flavor":           (10, lambda vs: f"{_fmt_list(vs)} flavors"),
+    # Texture — very tangible, second-most salient
+    "texture_profile":  (20, lambda vs: f"a {_fmt_list(vs)} texture"),
+    "texture":          (20, lambda vs: f"a {_fmt_list(vs)} texture"),
+    # Aromatics — perfume of the dish
+    "aromatic_signature": (30, lambda vs: f"{_fmt_list(vs)} aromatics"),
+    "aromatic":           (30, lambda vs: f"{_fmt_list(vs)} aromatics"),
+    # Cooking & heat — strip trailing "-heat"/"heat" from values so we don't
+    # get tautologies like "high-dry-heat heat"
+    "cooking_methods":  (40, lambda vs: f"{_fmt_list(vs)} cooking"),
+    "heat_intensity":   (50, lambda vs: f"{_fmt_list([v.replace(' heat','').replace('-heat','').strip() or v for v in vs])} heat"),
+    # Richness / fat — mouthfeel
+    "richness":         (60, lambda vs: f"a {_fmt_list(vs)} mouthfeel"),
+    "fat_character":    (65, lambda vs: f"{_fmt_list(vs)} fat character"),
+    # Spice lineage / marinade — provenance of the seasoning
+    "spice_lineage":    (70, lambda vs: f"{_fmt_list(vs)} spice lineage"),
+    "marinade_family":  (75, lambda vs: f"a {_fmt_list(vs)} marinade"),
+    # Role / format — lowest priority; often redundant with course
+    "sauce_role":       (80, lambda vs: f"{_fmt_list(vs)} sauce role"),
+    "course_role":      (85, lambda vs: f"{_fmt_list(vs)} course role"),
+    "regional_origin":  (90, lambda vs: f"roots in {_fmt_list(vs)}"),
+    "cultural_kin":     (92, lambda vs: f"kin with {_fmt_list(vs)}"),
+}
+
+
+def humanize_facet_reasons_v2(matched, max_fragments=4):
+    """Layer-2 formatting: group facet tokens by category and emit a natural-
+    language sentence. Falls back to Layer-1 comma list if nothing parses.
+
+    Example input:
+      ['flavor:smoky,umami-rich', 'texture:charred-crust,juicy-interior',
+       'richness:rich']
+    Output: 'Shares smoky and umami-rich flavors, a charred-crust, juicy-interior
+             texture, and a rich mouthfeel.'
+    """
+    if not matched:
+        return ""
+    # Group values by category, dedupe within each, preserving first-seen order
+    by_cat = {}
+    for tok in matched:
+        if not tok:
+            continue
+        raw = str(tok)
+        if ":" in raw:
+            cat, body = raw.split(":", 1)
+        else:
+            cat, body = "_other", raw
+        cat = cat.strip().lower()
+        vals = by_cat.setdefault(cat, [])
+        for v in body.split(","):
+            v = v.strip().replace("_", " ")
+            if v and v not in vals:
+                vals.append(v)
+
+    # Build fragments from known categories, ordered by priority
+    fragments = []
+    leftover = []
+    for cat, vals in by_cat.items():
+        if not vals:
+            continue
+        phraser = _FACET_PHRASERS.get(cat)
+        if phraser:
+            prio, fn = phraser
+            fragments.append((prio, fn(vals)))
+        else:
+            leftover.extend(vals)
+
+    fragments.sort(key=lambda x: x[0])
+    frags = [f for _, f in fragments[:max_fragments] if f]
+
+    if not frags:
+        # Pure Layer-1 fallback
+        return humanize_facet_reasons(matched)
+
+    sentence = "Shares " + _fmt_list(frags, max_n=max_fragments) + "."
+    # Capitalize only the leading "Shares"; rest stays lowercase (values are
+    # lowercase tokens like "smoky", "umami-rich").
+    return sentence
+
+
+def infer_effective_dietary(user_dietary, fav_dish_names):
+    """Auto-upgrade dietary preference from 'any' (or unset) to 'veg'/'vegan'
+    when ALL of the user's favorites are vegetarian. Protects users who
+    forget to set the dietary toggle on step 2 from silently getting
+    non-veg recommendations attributed to veg seeds.
+
+    Returns: (effective_dietary, was_auto_inferred)
+      - If user already set a non-'any' preference, returns it unchanged.
+      - If all favorites are strictly vegan → 'vegan'.
+      - Else if all favorites are veg/vegan → 'veg'.
+      - Otherwise returns the original preference unchanged.
+    """
+    raw = str(user_dietary or "").strip().lower()
+    if raw and raw != "any":
+        return raw, False
+    if hybrid_engine is None or not fav_dish_names:
+        return (raw or "any"), False
+    dietaries = []
+    for name in fav_dish_names:
+        info = hybrid_engine.get_dish_info(name)
+        if info and info.get("dietary_type"):
+            dietaries.append(str(info["dietary_type"]).strip().lower())
+    if not dietaries:
+        return (raw or "any"), False
+    all_vegan = all("vegan" in d for d in dietaries)
+    all_veg   = all(d in ("veg", "vegan", "vegetarian") for d in dietaries)
+    if all_vegan:
+        return "vegan", True
+    if all_veg:
+        return "veg", True
+    return (raw or "any"), False
+
+
+def infer_effective_proteins(user_allowed, user_dietary, fav_dish_names):
+    """Auto-narrow allowed proteins from 'any' to the subset actually represented
+    in the user's favorites. Cuisine-agnostic — the signal is the user's own picks.
+
+    Only fires when:
+      - User left allowed_proteins as "any" (didn't uncheck anything on step 2)
+      - User's dietary is non-veg or unset (veg/vegan/pescatarian already filter meat)
+
+    Returns: (effective_allowed, was_auto_inferred)
+      - effective_allowed: either "any" (unchanged) or a list of PROTEIN_GROUPS keys
+      - was_auto_inferred: True only when a strict subset was inferred
+    """
+    # Respect explicit user choice
+    if isinstance(user_allowed, list):
+        return user_allowed, False
+    if user_allowed != "any":
+        return user_allowed, False
+
+    # Veg-family dietary preferences already handle protein filtering upstream
+    d = str(user_dietary or "").strip().lower()
+    if d in ("veg", "vegan", "vegetarian", "pescatarian"):
+        return "any", False
+
+    if hybrid_engine is None or not fav_dish_names:
+        return "any", False
+
+    try:
+        from hybrid_engine import PROTEIN_GROUPS
+    except Exception:
+        return "any", False
+
+    # Build reverse lookup: raw protein name → group key
+    raw_to_group = {}
+    for gk, vals in PROTEIN_GROUPS.items():
+        for v in vals:
+            raw_to_group[str(v).strip().lower()] = gk
+
+    observed = []
+    saw_any_meat = False
+    for name in fav_dish_names:
+        info = hybrid_engine.get_dish_info(name)
+        if not info:
+            continue
+        # Skip veg/vegan favorites — they carry no meat signal
+        diet = str(info.get("dietary_type", "")).strip().lower()
+        if diet in ("veg", "vegan", "vegetarian"):
+            continue
+        proto = str(info.get("primary_protein", "")).strip().lower()
+        if not proto:
+            continue
+        saw_any_meat = True
+        gk = raw_to_group.get(proto)
+        if gk and gk not in observed:
+            observed.append(gk)
+
+    # No meat favorites at all → don't infer (dietary inference will catch all-veg)
+    if not saw_any_meat or not observed:
+        return "any", False
+
+    # Only infer if observed set is a strict subset of all groups
+    all_groups = set(PROTEIN_GROUPS.keys())
+    if set(observed) >= all_groups:
+        return "any", False
+
+    return observed, True
+
+
 # ── Visible / hidden selection with Option-C allocation + multi-fav attribution ──
 # Each engine collects up to `cap_per_seed` candidates per seed dish. This helper
 # then deduplicates across seeds, attaches the full list of seeds that ranked each
@@ -1044,6 +1272,13 @@ def recommend():
     for fd in fav_data:
         favorites_with_courses.append({"name": fd["name"], "course": fd["course"]})
 
+    # Auto-narrow allowed_proteins from 'any' based on favorites (once, before tc loop)
+    _raw_allowed_proteins = taste_prefs.get("allowed_proteins", "any")
+    _raw_dietary_for_protein_infer = taste_prefs.get("dietary", "any")
+    _effective_allowed_proteins, _proteins_auto_inferred_flag = infer_effective_proteins(
+        _raw_allowed_proteins, _raw_dietary_for_protein_infer, favorite_names
+    )
+
     # ── 2. Score dishes per target cuisine ──
     recommendations = {}
     all_scoring_details = {}
@@ -1062,14 +1297,17 @@ def recommend():
         # Dietary filter — explicit preference OR inferred from favorites
         dietary_pref = taste_prefs.get("dietary", "any")
         # Auto-infer: if ALL favorites are veg/vegan and user didn't set preference, treat as veg
+        _dietary_auto_inferred_flag = False
         if dietary_pref == "any":
             fav_dietaries = [f.get("dietary_type", "") for f in fav_data]
             all_veg = all(_is_veg(d) for d in fav_dietaries)
             all_vegan = all("vegan" in d for d in fav_dietaries)
             if all_vegan:
                 dietary_pref = "vegan"
+                _dietary_auto_inferred_flag = True
             elif all_veg:
                 dietary_pref = "veg"
+                _dietary_auto_inferred_flag = True
 
         if dietary_pref == "veg":
             tdf = tdf[tdf["dietary_type"].str.lower().isin(["veg", "vegan"])]
@@ -1085,8 +1323,8 @@ def recommend():
             if not tdf_veg.empty:
                 tdf = tdf_veg
 
-        # Protein filter — exclude meats the user doesn't eat
-        allowed_proteins = taste_prefs.get("allowed_proteins", "any")
+        # Protein filter — exclude meats the user doesn't eat (uses inferred list if any)
+        allowed_proteins = _effective_allowed_proteins
         if allowed_proteins != "any" and isinstance(allowed_proteins, list):
             from hybrid_engine import PROTEIN_GROUPS, ALL_MEAT_PROTEINS
             allowed_vals = set()
@@ -1318,6 +1556,8 @@ def recommend():
         "favorites_with_courses": favorites_with_courses,
         "taste_preferences": taste_prefs,
         "recommendations": recommendations,
+        "auto_inferred_dietary": (dietary_pref if _dietary_auto_inferred_flag else None),
+        "auto_inferred_proteins": (_effective_allowed_proteins if _proteins_auto_inferred_flag else None),
     })
 
 
@@ -2213,14 +2453,25 @@ def recommend_hybrid():
     dietary = taste_prefs.get("dietary", "")
     allowed_proteins = taste_prefs.get("allowed_proteins", "any")
 
+    if not favorite_dishes:
+        return jsonify({"error": "No favorite dishes provided."})
+
+    # Auto-infer: if user left dietary as "any" but every favorite is veg,
+    # upgrade to veg to prevent silent non-veg leaks attributed to veg seeds.
+    dietary, auto_inferred = infer_effective_dietary(dietary, favorite_dishes)
+    auto_inferred_dietary = dietary if auto_inferred else None
+
+    # Auto-narrow protein whitelist from 'any' to groups observed in favorites
+    allowed_proteins, proteins_auto_inferred = infer_effective_proteins(
+        allowed_proteins, dietary, favorite_dishes
+    )
+    auto_inferred_proteins = allowed_proteins if proteins_auto_inferred else None
+
     # prefer_vegetarian (from Protein Preferences) hard-filters to veg/vegan dishes.
     # If no veg results come back for a cuisine, we fall back to the user's original
     # dietary preference for that cuisine only.
     prefer_veg = bool(taste_prefs.get("prefer_vegetarian"))
     engine_dietary = "veg" if prefer_veg else dietary
-
-    if not favorite_dishes:
-        return jsonify({"error": "No favorite dishes provided."})
 
     # Build user flavor profile from favorites (average of seed flavors)
     from hybrid_engine import FLAVOR_DIMS as HF_DIMS
@@ -2250,24 +2501,46 @@ def recommend_hybrid():
         array). The first `visible_per_course` entries per course are the defaults;
         the remainder are revealed by a frontend "Show more" toggle.
         """
-        # per_seed_by_course[cat][seed_name] = [(score, matched_list, rec_dict), ...]
-        per_seed_by_course = {}
+        # Tier 1 (same-course seed→candidate) goes straight into per_seed_by_course.
+        # Tier 2 (cross-course) is held in tier2_by_course and only merged in if
+        # a target bucket is thin after Tier 1. This preserves "appetizer seeds
+        # own the appetizer bucket" while still filling sparse courses (e.g. no
+        # salad favorites) from cross-course overflow.
+        MIN_PER_COURSE = 3   # if Tier 1 gives fewer than 3 in a course, top up
+        fav_course_map = {f["name"]: canonical_category(f["course"]) for f in favorites_with_courses}
+
+        per_seed_by_course = {}   # cat → seed → [(score, matched, cand), ...]
+        tier2_by_course    = {}   # same shape, held back
         total_eval = 0
         for fav in favorite_dishes:
+            fav_course = fav_course_map.get(fav, "Main Course")
             result = hybrid_engine.get_recommendations(
                 seed_dish=fav,
                 user_preferences={"dietary": dietary_arg, "target_cuisine": tc, "discovery_mode": True, "allowed_proteins": allowed_proteins},
             )
             if isinstance(result, dict) and "recommendations" in result:
                 total_eval += result.get("pipeline_stats", {}).get("after_hard_filter", 0)
-                for rec in result["recommendations"][:3]:  # ≤3 per seed per course
+                for rec in result["recommendations"]:
                     cat = canonical_category(rec.get("category", "Main Course"))
-                    # Treat rec as the candidate dict; keep dish_name accessible.
                     rec_cand = dict(rec)
                     rec_cand["dish_name"] = rec["dish_name"]
-                    score = float(rec.get("match_score", 0.0))
+                    score   = float(rec.get("match_score", 0.0))
                     matched = [rec.get("match_reason")] if rec.get("match_reason") else []
-                    per_seed_by_course.setdefault(cat, {}).setdefault(fav, []).append((score, matched, rec_cand))
+                    entry   = (score, matched, rec_cand)
+                    if cat == fav_course:
+                        per_seed_by_course.setdefault(cat, {}).setdefault(fav, []).append(entry)
+                    else:
+                        tier2_by_course.setdefault(cat, {}).setdefault(fav, []).append(entry)
+
+        # Tier 2 top-up: for each course with held-back candidates, merge them
+        # into per_seed_by_course only if the Tier 1 bucket is under the threshold.
+        for cat, t2_seeds in tier2_by_course.items():
+            existing = per_seed_by_course.get(cat, {})
+            total_existing = sum(len(v) for v in existing.values())
+            if total_existing >= MIN_PER_COURSE:
+                continue
+            for seed, picks in t2_seeds.items():
+                per_seed_by_course.setdefault(cat, {}).setdefault(seed, []).extend(picks)
 
         def _build_h1_entry(entry, cat):
             cand = entry["cand"]
@@ -2357,6 +2630,8 @@ def recommend_hybrid():
         "favorites_with_courses": favorites_with_courses,
         "user_profile": user_profile,
         "recommendations": all_recommendations,
+        "auto_inferred_dietary": auto_inferred_dietary,
+        "auto_inferred_proteins": auto_inferred_proteins,
     })
 
 
@@ -2432,6 +2707,16 @@ def recommend_hybrid_v2():
 
     if not favorite_dishes:
         return jsonify({"error": "No favorite dishes provided."})
+
+    # Auto-infer veg/vegan from favorites when dietary is "any" or unset.
+    dietary, auto_inferred = infer_effective_dietary(dietary, favorite_dishes)
+    auto_inferred_dietary  = dietary if auto_inferred else None
+
+    # Auto-narrow protein whitelist from 'any' based on observed favorites.
+    allowed_proteins, proteins_auto_inferred = infer_effective_proteins(
+        allowed_proteins, dietary, favorite_dishes
+    )
+    auto_inferred_proteins = allowed_proteins if proteins_auto_inferred else None
 
     # ── Protein whitelist (reuse hybrid engine's grouping) ──
     from hybrid_engine import PROTEIN_GROUPS
@@ -2663,12 +2948,51 @@ def recommend_hybrid_v2():
             out["matched_favorites"] = matched_favorites_display
             return out
 
+        # ── Same-course priority (Tier 1 vs Tier 2) ──
+        # Users expect appetizer picks to attribute to appetizer seeds first.
+        # For each bucket: run Option-C on seeds whose course matches the
+        # bucket (Tier 1). Tier 2 (cross-course seeds) is only consulted when
+        # Tier 1's combined pool is below MIN_PER_COURSE — matches the same
+        # threshold rule used in Hybrid 1.0 / 3.0.
+        MIN_PER_COURSE = 3
+        seed_course = {
+            f["name"]: canonical_category(f["course"])
+            for f in favorites_with_courses
+        }
+
         for cat, per_seed in per_seed_by_course.items():
-            visible_entries, hidden_entries = select_with_show_more(
-                per_seed, max_visible=3, max_hidden=6, score_floor=0.0,
+            same_seed  = {s: picks for s, picks in per_seed.items() if seed_course.get(s) == cat}
+            cross_seed = {s: picks for s, picks in per_seed.items() if seed_course.get(s) != cat}
+
+            # Tier 1: same-course
+            t1_visible, t1_hidden = select_with_show_more(
+                same_seed, max_visible=3, max_hidden=6, score_floor=0.0,
             )
-            entries = [_build_h2_entry(e, cat) for e in visible_entries]
-            entries += [_build_h2_entry(e, cat) for e in hidden_entries]
+
+            # Tier 2: only invoked if Tier 1's total pool is thin. Once Tier 1
+            # fills >= MIN_PER_COURSE candidates, cross-course seeds stay out
+            # of both visible and Show-More pools entirely.
+            t2_visible, t2_hidden = [], []
+            t1_total = len(t1_visible) + len(t1_hidden)
+            if cross_seed and t1_total < MIN_PER_COURSE:
+                need = max(0, 3 - len(t1_visible))
+                t2_visible, t2_hidden = select_with_show_more(
+                    cross_seed, max_visible=need, max_hidden=6, score_floor=0.0,
+                )
+
+            # Dedup across tiers by dish_name (same dish may appear in both)
+            seen_names = {e["cand"].get("dish_name") for e in t1_visible}
+            t2_visible = [e for e in t2_visible if e["cand"].get("dish_name") not in seen_names]
+            seen_names |= {e["cand"].get("dish_name") for e in t2_visible}
+            t1_hidden  = [e for e in t1_hidden  if e["cand"].get("dish_name") not in seen_names]
+            seen_names |= {e["cand"].get("dish_name") for e in t1_hidden}
+            t2_hidden  = [e for e in t2_hidden  if e["cand"].get("dish_name") not in seen_names]
+
+            visible = t1_visible + t2_visible
+            hidden  = t1_hidden  + t2_hidden
+
+            entries = [_build_h2_entry(e, cat) for e in visible]
+            entries += [_build_h2_entry(e, cat) for e in hidden]
             if entries:
                 courses_dict[cat] = entries
 
@@ -2688,6 +3012,8 @@ def recommend_hybrid_v2():
         "user_profile": user_profile,
         "recommendations": all_recommendations,
         "prefer_vegetarian_applied": prefer_veg,
+        "auto_inferred_dietary": auto_inferred_dietary,
+        "auto_inferred_proteins": auto_inferred_proteins,
     })
 
 
@@ -2918,8 +3244,18 @@ def recommend_hybrid_v3():
     if not favorite_dishes:
         return jsonify({"error": "No favorite dishes provided."})
 
+    # Auto-infer veg/vegan from favorites when dietary is "any" or unset.
+    dietary, auto_inferred = infer_effective_dietary(dietary, favorite_dishes)
+    auto_inferred_dietary  = dietary if auto_inferred else None
+
+    # Auto-narrow protein whitelist from 'any' based on observed favorites.
+    allowed_proteins, proteins_auto_inferred = infer_effective_proteins(
+        allowed_proteins, dietary, favorite_dishes
+    )
+    auto_inferred_proteins = allowed_proteins if proteins_auto_inferred else None
+
     prefer_veg = bool(taste_prefs.get("prefer_vegetarian")) or dietary in ("veg", "vegan", "vegetarian")
-    print(f"[hybrid-v3] taste_prefs={taste_prefs} → prefer_veg={prefer_veg}", flush=True)
+    print(f"[hybrid-v3] taste_prefs={taste_prefs} → prefer_veg={prefer_veg} auto_inferred={auto_inferred} proteins_auto_inferred={proteins_auto_inferred}", flush=True)
 
     # ── Protein whitelist ──
     from hybrid_engine import PROTEIN_GROUPS
@@ -3026,9 +3362,17 @@ def recommend_hybrid_v3():
         # on display labels (see canonical_category above).
         _display_cat = canonical_category
 
-        # ── Phase 1: collect top-3 per seed, grouped by category ──
-        # per_seed_by_course[cat][seed_name] = [(score, matched, cand_dict), ...]
+        # ── Phase 1: collect Tier 1 (same-course) + Tier 2 (cross-course held back) ──
+        # Tier 1: each seed contributes its top-3 SAME-COURSE matches. These go
+        # straight into per_seed_by_course[cat][seed].
+        # Tier 2: each seed also keeps its top-6 cross-course matches stashed in
+        # tier2_by_course. They only get merged into per_seed_by_course later if
+        # the target bucket is thinner than MIN_PER_COURSE — preserves "appetizer
+        # seeds own the appetizer bucket" while letting sparse buckets (e.g. no
+        # salad favorites) fill from cross-course overflow rather than stay empty.
+        MIN_PER_COURSE = 3
         per_seed_by_course = {}
+        tier2_by_course    = {}
         for fav in favorite_dishes:
             seed_rows = fdf[fdf["dish_name"] == fav]
             if seed_rows.empty:
@@ -3036,27 +3380,38 @@ def recommend_hybrid_v3():
             seed = seed_rows.iloc[0].to_dict()
             seed_cat = _norm_cat(seed.get("category"))
 
-            # Score every candidate whose category matches the seed's.
-            # Without this gate, facet-overlap alone lets non-dessert "stew-like
-            # comfort bowls" (e.g. Avgolemono Soup, Moussaka) leak into dessert
-            # recommendations for a dessert seed (e.g. Gajar Ka Halwa).
-            scored = []
+            scored_t1 = []   # same-course
+            scored_t2 = []   # cross-course (held back)
             for _, cand in pool.iterrows():
                 if cand["dish_name"] == fav and str(cand["cuisine"]).lower() == source_cuisine.lower():
                     continue  # skip self
-                if seed_cat and _norm_cat(cand.get("category")) != seed_cat:
-                    continue
                 s, matched = _facet_overlap_score(seed, cand, "veg" if prefer_veg else dietary)
                 if s <= 0:
                     continue
-                scored.append((s, matched, cand.to_dict()))
+                cand_d = cand.to_dict()
+                if seed_cat and _norm_cat(cand.get("category")) != seed_cat:
+                    scored_t2.append((s, matched, cand_d))
+                else:
+                    scored_t1.append((s, matched, cand_d))
 
-            scored.sort(key=lambda x: x[0], reverse=True)
+            scored_t1.sort(key=lambda x: x[0], reverse=True)
+            scored_t2.sort(key=lambda x: x[0], reverse=True)
 
-            # Enforce "≤3 per favorite per course" — your explicit constraint.
-            for s, matched, cand in scored[:3]:
+            for s, matched, cand in scored_t1[:3]:
                 cat = _display_cat(cand.get("category"))
                 per_seed_by_course.setdefault(cat, {}).setdefault(fav, []).append((s, matched, cand))
+            for s, matched, cand in scored_t2[:6]:
+                cat = _display_cat(cand.get("category"))
+                tier2_by_course.setdefault(cat, {}).setdefault(fav, []).append((s, matched, cand))
+
+        # Tier 2 top-up: only merge when same-course bucket is below threshold.
+        for cat, t2_seeds in tier2_by_course.items():
+            existing = per_seed_by_course.get(cat, {})
+            total_existing = sum(len(v) for v in existing.values())
+            if total_existing >= MIN_PER_COURSE:
+                continue
+            for seed, picks in t2_seeds.items():
+                per_seed_by_course.setdefault(cat, {}).setdefault(seed, []).extend(picks)
 
         # ── Phase 2: dedup + Option-C visible slice + hidden pool ──
         def _build_dish_entry(entry, cat):
@@ -3066,9 +3421,10 @@ def recommend_hybrid_v3():
             # Score scaling: facet score → 0-100 display. Typical strong matches
             # land around 15-25; cap at 100.
             display_score = min(100, round(top["score"] * 4, 1))
+            # Human-readable reason: strip schema prefixes, dedupe values.
             why_text = (
-                " · ".join(top["matched"][:5]) if top["matched"]
-                else f"Facet overlap score: {top['score']:.1f}"
+                humanize_facet_reasons_v2(top["matched"])
+                or f"Facet overlap score: {top['score']:.1f}"
             )
             # Multi-favorite attribution array — each seed's similarity shown
             # as a display percentage, same scaling as `score`.
@@ -3077,6 +3433,8 @@ def recommend_hybrid_v3():
                     "name":  mf["name"],
                     "score": min(100, round(mf["score"] * 4, 1)),
                     "facets": mf["matched"][:5],
+                    # Human-readable phrase for this specific seed
+                    "why":   humanize_facet_reasons_v2(mf["matched"]),
                 }
                 for mf in mfs
             ]
@@ -3134,6 +3492,8 @@ def recommend_hybrid_v3():
         "user_profile": user_profile,
         "recommendations": all_recommendations,
         "prefer_vegetarian_applied": prefer_veg,
+        "auto_inferred_dietary": auto_inferred_dietary,
+        "auto_inferred_proteins": auto_inferred_proteins,
     })
 
 

@@ -809,6 +809,34 @@ body {
   .comparison-grid { grid-template-columns: 1fr; }
 }
 
+/* ─ Auto-inferred dietary banner ─────────────────────────────────── */
+.auto-infer-banner {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.7rem;
+  padding: 0.75rem 1rem;
+  background: #f0fdf4;
+  border: 1px solid #bbf7d0;
+  border-left: 4px solid #16a34a;
+  border-radius: 10px;
+  margin: 0 0 1rem;
+  font-size: 0.88rem;
+  color: #14532d;
+  line-height: 1.45;
+}
+.auto-infer-banner .auto-infer-icon {
+  font-size: 1.2rem;
+  line-height: 1;
+  margin-top: 1px;
+}
+.auto-infer-banner a {
+  color: #15803d;
+  font-weight: 600;
+  text-decoration: underline;
+  margin-left: 0.25rem;
+}
+.auto-infer-banner a:hover { color: #14532d; }
+
 /* ─ Show more / Show less toggle ─────────────────────────────────── */
 .show-more-btn {
   display: block;

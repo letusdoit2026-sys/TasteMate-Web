@@ -96,6 +96,42 @@ function matchedFavLine(dish, showScores) {
 let _smUid = 0;
 function nextShowMoreId() { return `sm-${++_smUid}`; }
 
+// Banner shown when the server auto-upgraded the user's dietary preference
+// based on their favorites (e.g. all picks were veg → filter to veg).
+// Lets the user know a filter was applied silently and how to undo it.
+function autoInferredBanner(inferred) {
+  const label = inferred === "vegan" ? "Vegan" : "Vegetarian";
+  return `<div class="auto-infer-banner">
+    <span class="auto-infer-icon">🌱</span>
+    <div>
+      <strong>Filtered to ${label}</strong> — all your favorites are ${label.toLowerCase()}, so we hid non-veg recommendations.
+      <a href="#" onclick="goToStep(2);return false">Change diet preference</a> if this isn't what you wanted.
+    </div>
+  </div>`;
+}
+
+// Banner shown when the server auto-narrowed the user's allowed proteins from
+// "any" to the subset actually seen in their favorites (e.g. only chicken+lamb
+// picks → hide beef/pork recommendations). Parallels autoInferredBanner for proteins.
+const PROTEIN_LABELS = {
+  chicken: "Chicken", fish: "Fish & Seafood", lamb: "Lamb / Goat",
+  beef: "Beef / Veal", pork: "Pork", duck: "Duck / Quail / Rabbit", egg: "Egg",
+};
+function autoInferredProteinBanner(inferredList) {
+  if (!Array.isArray(inferredList) || inferredList.length === 0) return "";
+  const labels = inferredList.map(k => PROTEIN_LABELS[k] || k);
+  const joined = labels.length === 1
+    ? labels[0]
+    : labels.slice(0, -1).join(", ") + " & " + labels[labels.length - 1];
+  return `<div class="auto-infer-banner">
+    <span class="auto-infer-icon">🥩</span>
+    <div>
+      <strong>Filtered to ${joined}</strong> — your favorites only use these proteins, so we hid other meats.
+      <a href="#" onclick="goToStep(2);return false">Change protein preferences</a> if this isn't what you wanted.
+    </div>
+  </div>`;
+}
+
 // Toggle a hidden-dishes block (called inline from the button).
 function toggleShowMore(id, totalHidden) {
   const box = document.getElementById(id);
@@ -483,6 +519,13 @@ async function getRecommendations() {
 function renderResults(data) {
   let html = "";
 
+  if (data.auto_inferred_dietary) {
+    html += autoInferredBanner(data.auto_inferred_dietary);
+  }
+  if (data.auto_inferred_proteins) {
+    html += autoInferredProteinBanner(data.auto_inferred_proteins);
+  }
+
   // ── User profile card ──
   html += `<div class="profile-card">
     <h3>Your Flavor DNA <span class="profile-sub">based on ${data.favorites_used.length} ${data.source_cuisine} dishes</span></h3>
@@ -592,6 +635,20 @@ function renderResults(data) {
 // ══════════════════════════════════════════════════════════════════════════════
 function renderComparisonResults(engineResults) {
   let html = "";
+
+  // Auto-inferred dietary notice (pick from any engine that reported it)
+  const inferred = engineResults
+    .map(e => e.data && e.data.auto_inferred_dietary)
+    .find(v => v);
+  if (inferred) {
+    html += autoInferredBanner(inferred);
+  }
+  const inferredProteins = engineResults
+    .map(e => e.data && e.data.auto_inferred_proteins)
+    .find(v => Array.isArray(v) && v.length);
+  if (inferredProteins) {
+    html += autoInferredProteinBanner(inferredProteins);
+  }
 
   // Use the first successful result for profile/favorites display
   const first = engineResults.find(e => e.data);
@@ -722,8 +779,20 @@ function showCompactDetail(dish) {
   html += `<span class="engine-badge" style="font-size:0.7rem;padding:2px 8px;border-radius:8px;background:${border}15;color:${border}">${dish._engineLabel}</span>`;
   html += `<p style="color:var(--text-muted);margin:0.5rem 0">${dish.category || ""} | ${dish.dietary || ""} ${dish.protein ? "| " + dish.protein : ""}</p>`;
 
-  if (dish.matched_favorite) {
-    html += `<div class="matched-fav-badge" style="margin:0.5rem 0">Because you liked <strong>${dish.matched_favorite}</strong> (${dish.matched_favorite_score || dish.score}% match)</div>`;
+  {
+    const line = matchedFavLine(dish, true);
+    if (line) html += `<div class="matched-fav-badge" style="margin:0.5rem 0">${line}</div>`;
+  }
+  // Per-seed breakdown when multiple favorites contributed
+  if (Array.isArray(dish.matched_favorites) && dish.matched_favorites.length > 1) {
+    html += `<div class="per-seed-list" style="margin:0.4rem 0 0.6rem">`;
+    dish.matched_favorites.forEach(mf => {
+      const whyBit = mf.why ? ` — ${mf.why}` : "";
+      html += `<div class="per-seed-item" style="font-size:0.78rem;color:var(--text-muted);margin:0.15rem 0">
+        · <strong>${mf.name}</strong> (${Math.round(mf.score || 0)}%)${whyBit}
+      </div>`;
+    });
+    html += `</div>`;
   }
 
   html += `<p style="font-size:0.85rem;margin:0.5rem 0">${dish.description || ""}</p>`;
@@ -849,8 +918,22 @@ function showDetail(dish, userProfile) {
   html += `<h2 class="modal-title">${dish.dish_name}</h2>
     <p class="modal-subtitle">${dish.course} &rsaquo; ${dish.category} | ${dish.dietary} | ${dish.protein} | Spice: ${dish.spice_level}</p>`;
 
-  if (dish.matched_favorite) {
-    html += `<div class="matched-fav-badge" style="margin-bottom:0.75rem">Recommended because you liked <strong>${dish.matched_favorite}</strong> (${dish.matched_favorite_score}% match)</div>`;
+  {
+    const line = matchedFavLine(dish, true);
+    if (line) {
+      html += `<div class="matched-fav-badge" style="margin-bottom:0.75rem">Recommended — ${line}</div>`;
+    }
+  }
+  // Per-seed breakdown when multiple favorites contributed
+  if (Array.isArray(dish.matched_favorites) && dish.matched_favorites.length > 1) {
+    html += `<div class="per-seed-list" style="margin:-0.4rem 0 0.8rem">`;
+    dish.matched_favorites.forEach(mf => {
+      const whyBit = mf.why ? ` — ${mf.why}` : "";
+      html += `<div class="per-seed-item" style="font-size:0.82rem;color:var(--text-muted);margin:0.2rem 0">
+        · <strong>${mf.name}</strong> (${Math.round(mf.score || 0)}%)${whyBit}
+      </div>`;
+    });
+    html += `</div>`;
   }
 
   html += `<p style="font-size:0.9rem;color:var(--text-muted);margin-bottom:0.5rem">${dish.description}</p>
